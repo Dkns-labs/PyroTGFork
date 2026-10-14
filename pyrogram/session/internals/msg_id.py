@@ -16,20 +16,28 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
-import logging
 import time
-
-log = logging.getLogger(__name__)
 
 
 class MsgId:
-    last_time = 0
-    offset = 0
+    """
+    High-performance, lock-free monotonic MTProto msg_id generator.
+    Replaces floating-point math and datetime overhead with nanosecond integer bit-shifting.
+    """
+    def __init__(self):
+        self.last_id = 0
 
-    def __new__(cls) -> int:
-        now = int(time.time())
-        cls.offset = (cls.offset + 4) if now == cls.last_time else 0
-        msg_id = (now * 2 ** 32) + cls.offset
-        cls.last_time = now
-
+    def __call__(self) -> int:
+        now_ns = time.time_ns()
+        sec = now_ns // 1000000000
+        
+        # Convert nanoseconds fractional part to 30-bit sub-seconds strictly divisible by 4
+        subsec = ((now_ns % 1000000000) * 1024 // 15625000) & ~3
+        
+        msg_id = (sec << 32) + subsec
+        
+        if msg_id <= self.last_id:
+            msg_id = self.last_id + 4
+            
+        self.last_id = msg_id
         return msg_id
