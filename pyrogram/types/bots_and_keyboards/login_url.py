@@ -17,52 +17,36 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 from pyrogram import raw
-
 from ..object import Object
 
 
 class LoginUrl(Object):
     """Represents a parameter of the inline keyboard button used to automatically authorize a user.
 
-    Serves as a great replacement for the Telegram Login Widget when the user is coming from Telegram.
-    All the user needs to do is tap/click a button and confirm that they want to log in.
-
     Parameters:
         url (``str``):
             An HTTP URL to be opened with user authorization data added to the query string when the button is pressed.
-            If the user refuses to provide authorization data, the original URL without information about the user will
-            be opened. The data added is the same as described in
-            `Receiving authorization data <https://core.telegram.org/widgets/login#receiving-authorization-data>`.
-
-            .. note::
-            
-                You **must** always check the hash of the received data to verify the authentication
-                and the integrity of the data as described in `Checking authorization <https://core.telegram.org/widgets/login#checking-authorization>`_.
 
         forward_text (``str``, *optional*):
             New text of the button in forwarded messages.
 
         bot_username (``str``, *optional*):
             Username of a bot, which will be used for user authorization.
-            See `Setting up a bot <https://core.telegram.org/widgets/login#setting-up-a-bot>`_ for more details.
-            If not specified, the current bot's username will be assumed. The url's domain must be the same as the
-            domain linked with the bot.
-            See `Linking your domain to the bot <https://core.telegram.org/widgets/login#linking-your-domain-to-the-bot>`_
-            for more details.
 
-        request_write_access (``str``, *optional*):
+        request_write_access (``bool``, *optional*):
             Pass True to request the permission for your bot to send messages to the user.
 
-        button_id (``int``):
+        button_id (``int``, *optional*):
             Button identifier.
     """
 
     def __init__(
-        self, *,
+        self,
+        *,
         url: str,
         forward_text: str = None,
         bot_username: str = None,
-        request_write_access: str = None,
+        request_write_access: bool = None,
         button_id: int = None
     ):
         super().__init__()
@@ -74,19 +58,20 @@ class LoginUrl(Object):
         self.button_id = button_id
 
     @staticmethod
-    def read(b: "raw.types.KeyboardButtonUrlAuth") -> "LoginUrl":
-        return LoginUrl(
-            url=b.url,
-            forward_text=b.fwd_text,
-            button_id=b.button_id
-        )
+    def read(b) -> "LoginUrl":
+        # Layer 230: InlineButtonTypeUrlAuth
+        if isinstance(b, raw.types.InlineButtonTypeUrlAuth):
+            return LoginUrl(
+                url=b.url,
+                forward_text=getattr(b, "fwd_text", None),
+                button_id=getattr(b, "button_id", None)
+            )
+        return LoginUrl(url=getattr(b, "url", ""))
 
-    def write(self, text: str, bot: "raw.types.InputUser", style: "raw.types.KeyboardButtonStyle"):
-        return raw.types.InputKeyboardButtonUrlAuth(
-            text=text,
+    def write(self, text: str, bot: "raw.base.InputUser"):
+        return raw.types.InputInlineButtonTypeUrlAuth(
             url=self.url,
             bot=bot,
             fwd_text=self.forward_text,
-            request_write_access=self.request_write_access,
-            style=style
+            request_write_access=bool(self.request_write_access)
         )
