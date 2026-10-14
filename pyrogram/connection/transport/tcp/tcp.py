@@ -20,108 +20,143 @@ import asyncio
 import ipaddress
 import logging
 import socket
-import time
-from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple
 
-try:
-    import socks
-except ImportError as e:
-    e.msg = (
-        "PySocks is missing and Pyrogram can't run without. "
-        "Please install it using \"pip3 install pysocks\"."
-    )
-
-    raise e
-
-from pyrogram import utils
+import socks
 
 log = logging.getLogger(__name__)
 
 
 class TCP:
     TIMEOUT = 10
+    SOCKET_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB TCP send/recv window for high-speed throughput
 
     def __init__(self, ipv6: bool, proxy: dict):
         self.socket = None
 
-        self.reader = None  # type: asyncio.StreamReader
-        self.writer = None  # type: asyncio.StreamWriter
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
 
         self.lock = asyncio.Lock()
-        self.loop = utils.get_event_loop()
+        self.loop = asyncio.get_event_loop()
 
-        if proxy:
-            hostname = proxy.get("hostname")
+        self.ipv6 = ipv6
+        self.proxy = proxy
 
-            try:
-                ip_address = ipaddress.ip_address(hostname)
-            except ValueError:
-                self.socket = socks.socksocket(socket.AF_INET)
-            else:
-                if isinstance(ip_address, ipaddress.IPv6Address):
-                    self.socket = socks.socksocket(socket.AF_INET6)
-                else:
-                    self.socket = socks.socksocket(socket.AF_INET)
-
-            self.socket.set_proxy(
-                proxy_type=getattr(socks, proxy.get("scheme").upper()),
-                addr=hostname,
-                port=proxy.get("port", None),
-                username=proxy.get("username", None),
-                password=proxy.get("password", None)
-            )
-
-            log.info(f"Using proxy {hostname}")
-        else:
-            self.socket = socks.socksocket(
-                socket.AF_INET6 if ipv6
-                else socket.AF_INET
-            )
-
-        self.socket.settimeout(TCP.TIMEOUT)
-
-    async def connect(self, address: tuple):
-        # The socket used by the whole logic is blocking and thus it blocks when connecting.
-        # Offload the task to a thread executor to avoid blocking the main event loop.
-        with ThreadPoolExecutor(1) as executor:
-            await self.loop.run_in_executor(executor, self.socket.connect, address)
-
-        self.reader, self.writer = await asyncio.open_connection(sock=self.socket)
-
-    def close(self):
+    @staticmethod
+    def _tune_socket(sock: socket.socket):
+        """Apply low-latency and high-bandwidth socket flags."""
         try:
-            self.writer.close()
-        except AttributeError:
-            try:
-                self.socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            finally:
-                # A tiny sleep placed here helps avoiding .recv(n) hanging until the timeout.
-                # This is a workaround that seems to fix the occasional delayed stop of a client.
-                time.sleep(0.001)
-                self.socket.close()
+            # Disable Nagle's algorithm for instant RPC & chunk transmission
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except (OSError, AttributeError):
+            pass
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP.SOCKET_BUFFER_SIZE)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP.SOCKET_BUFFER_SIZE)
+        except (OSError, AttributeError):
+            pass
+
+    async def _connect(self, address: Tuple[str, int]):
+        if self.proxy:
+            ip, port = address
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            sock = socks.socksocket(family)
+
+            sock.set_proxy(
+                proxy_type=getattr(socks, self.proxy.get("scheme").upper()),
+                addr=self.proxy.get("hostname"),
+                port=self.proxy.get("port"),
+                username=self.proxy.get("username"),
+                password=self.proxy.get("password")
+            )
+            sock.settimeout(TCP.TIMEOUT)
+
+            await self.loop.run_in_executor(
+                None,
+                sock.connect,
+                address
+            )
+
+            sock.setblocking(False)
+            self._tune_socket(sock)
+
+            self.reader, self.writer = await asyncio.open_connection(
+                sock=sock,
+                limit=self.SOCKET_BUFFER_SIZE
+            )
+        else:
+            self.reader, self.writer = await asyncio.open_connection(
+                host=address[0],
+                port=address[1],
+                family=socket.AF_INET6 if self.ipv6 else socket.AF_INET,
+                limit=self.SOCKET_BUFFER_SIZE
+            )
+
+            sock = self.writer.get_extra_info("socket")
+            if sock is not None:
+                self._tune_socket(sock)
+
+                # Expand asyncio transport write buffer limits so 512 KB chunks don't pause the protocol
+                transport = self.writer.transport
+                if hasattr(transport, "set_write_buffer_limits"):
+                    transport.set_write_buffer_limits(
+                        high=self.SOCKET_BUFFER_SIZE,
+                        low=self.SOCKET_BUFFER_SIZE // 4
+                    )
+
+    async def connect(self, address: Tuple[str, int]):
+        try:
+            await asyncio.wait_for(self._connect(address), timeout=TCP.TIMEOUT)
+        except asyncio.TimeoutError:
+            raise TimeoutError("Connection timed out")
+
+    async def close(self):
+        async with self.lock:
+            if self.writer is not None:
+                try:
+                    self.writer.close()
+                    await asyncio.wait_for(self.writer.wait_closed(), timeout=1.5)
+                except Exception as e:
+                    log.debug("Socket close ignored exception: %s", e)
+                finally:
+                    self.writer = None
+                    self.reader = None
 
     async def send(self, data: bytes):
         async with self.lock:
-            self.writer.write(data)
-            await self.writer.drain()
+            if self.writer is None:
+                raise ConnectionResetError("Connection is closed")
 
-    async def recv(self, length: int = 0):
-        data = b""
+            try:
+                # Write directly on the event loop without thread executor overhead
+                self.writer.write(data)
+                await self.writer.drain()
+            except Exception as e:
+                log.info("Send exception: %s %s", type(e).__name__, e)
+                raise OSError(e)
+
+    async def recv(self, length: int = 0) -> Optional[bytes]:
+        data = bytearray()
 
         while len(data) < length:
             try:
                 chunk = await asyncio.wait_for(
                     self.reader.read(length - len(data)),
-                    TCP.TIMEOUT
+                    timeout=TCP.TIMEOUT
                 )
             except (OSError, asyncio.TimeoutError):
                 return None
             else:
                 if chunk:
-                    data += chunk
+                    data.extend(chunk)
                 else:
                     return None
 
-        return data
+        return bytes(data)
