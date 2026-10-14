@@ -16,6 +16,7 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+import logging
 from hashlib import sha256
 from io import BytesIO
 from os import urandom
@@ -24,8 +25,10 @@ from pyrogram.errors import SecurityCheckMismatch
 from pyrogram.raw.core import Message, Long
 from . import aes
 
+log = logging.getLogger(__name__)
 
-def kdf(auth_key: bytes, msg_key: bytes, outgoing: bool) -> tuple:
+
+def _kdf_py(auth_key: bytes, msg_key: bytes, outgoing: bool) -> tuple:
     # https://core.telegram.org/mtproto/description#defining-aes-key-and-initialization-vector
     x = 0 if outgoing else 8
 
@@ -36,6 +39,46 @@ def kdf(auth_key: bytes, msg_key: bytes, outgoing: bool) -> tuple:
     aes_iv = sha256_b[:8] + sha256_a[8:24] + sha256_b[24:32]
 
     return aes_key, aes_iv
+
+
+def _pick_kdf_backend():
+    # Priority: HyperCrypto > WarpCrypto > pure-Python (hashlib)
+    # Backend ka output pehle pure-Python wale se match karke dekhte hain,
+    # mismatch ho to us backend ko skip kar dete hain (safety check).
+    test_auth_key = bytes(range(256))
+    test_msg_key = bytes(range(16))
+
+    for name in ("hypercrypto", "warpcrypto"):
+        try:
+            backend = __import__(name)
+        except ImportError:
+            continue
+
+        try:
+            for outgoing in (True, False):
+                got = backend.kdf(test_auth_key, test_msg_key, outgoing)
+                got = (bytes(got[0]), bytes(got[1]))
+
+                if got != _kdf_py(test_auth_key, test_msg_key, outgoing):
+                    raise ValueError("kdf output mismatch")
+        except Exception as e:
+            log.warning("%s kdf skipped: %s", name, e)
+            continue
+
+        log.info("Using %s for kdf", name)
+        return backend.kdf
+
+    return None
+
+
+_kdf_backend = _pick_kdf_backend()
+
+
+if _kdf_backend is not None:
+    def kdf(auth_key: bytes, msg_key: bytes, outgoing: bool) -> tuple:
+        return _kdf_backend(auth_key, msg_key, outgoing)
+else:
+    kdf = _kdf_py
 
 
 def pack(message: Message, salt: int, session_id: bytes, auth_key: bytes, auth_key_id: bytes) -> bytes:
