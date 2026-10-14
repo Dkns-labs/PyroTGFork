@@ -57,7 +57,8 @@ from pyrogram.errors import (
 from pyrogram.handlers.handler import Handler
 from pyrogram.methods import Methods
 from pyrogram.session import Auth, Session
-from pyrogram.storage import SQLiteStorage, Storage
+# --- EDIT A: import FileStorage / MemoryStorage instead of SQLiteStorage ---
+from pyrogram.storage import FileStorage, MemoryStorage, Storage
 from pyrogram.types import TermsOfService, User
 from pyrogram.utils import MIN_MONOFORUM_CHANNEL_ID, ainput
 from .connection import Connection
@@ -195,15 +196,13 @@ class Client(Methods):
         if self.in_memory is None:
             self.in_memory = bool(self.session_string)
 
+        # --- EDIT B: pick a concrete (non-abstract) storage class ---
         if isinstance(storage_engine, Storage):
             self.storage = storage_engine
+        elif self.in_memory:
+            self.storage = MemoryStorage(self.name, self.session_string)
         else:
-            self.storage = SQLiteStorage(
-                self.name,
-                workdir=self.workdir,
-                session_string=self.session_string,
-                in_memory=self.in_memory,
-            )
+            self.storage = FileStorage(self.name, self.workdir)
 
         self.dispatcher = Dispatcher(self)
         self.rnd_id = MsgId
