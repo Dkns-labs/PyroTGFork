@@ -20,26 +20,31 @@ import logging
 
 log = logging.getLogger(__name__)
 
-try:
-    import tgcrypto
+# Backend priority: HyperCrypto > WarpCrypto > TgCrypto > pure-Python (pyaes)
+_backend = None
+for _name in ("hypercrypto", "warpcrypto", "tgcrypto"):
+    try:
+        _backend = __import__(_name)
+        log.info("Using %s", _name)
+        break
+    except ImportError:
+        continue
 
-    log.info("Using TgCrypto")
-
-
+if _backend is not None:
     def ige256_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return tgcrypto.ige256_encrypt(data, key, iv)
+        return _backend.ige256_encrypt(data, key, iv)
 
 
     def ige256_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-        return tgcrypto.ige256_decrypt(data, key, iv)
+        return _backend.ige256_decrypt(data, key, iv)
 
 
     def ctr256_encrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return tgcrypto.ctr256_encrypt(data, key, iv, state or bytearray(1))
+        return _backend.ctr256_encrypt(data, key, iv, state or bytearray(1))
 
 
     def ctr256_decrypt(data: bytes, key: bytes, iv: bytearray, state: bytearray = None) -> bytes:
-        return tgcrypto.ctr256_decrypt(data, key, iv, state or bytearray(1))
+        return _backend.ctr256_decrypt(data, key, iv, state or bytearray(1))
 
 
     def xor(a: bytes, b: bytes) -> bytes:
@@ -48,11 +53,11 @@ try:
             len(a),
             "big",
         )
-except ImportError:
+else:
     import pyaes
 
     log.warning(
-        "TgCrypto is missing! "
+        "No fast crypto backend found (hypercrypto / warpcrypto / tgcrypto)! "
         "Pyrogram will work the same, but at a much slower speed. "
         "More info: https://telegramplayground.github.io/pyrogram/topics/speedups"
     )
