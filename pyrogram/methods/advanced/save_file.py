@@ -25,7 +25,7 @@ import math
 import os
 from hashlib import md5
 from pathlib import Path, PurePath
-from typing import Callable, Union
+from typing import BinaryIO, Callable, Optional, Union
 
 import pyrogram
 from pyrogram import StopTransmission, raw
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 class SaveFile:
     async def _get_upload_sessions(self, count: int) -> list[Session]:
-        """ Maintain a persistent pool of warm media upload sessions to avoid repeated TCP/MTProto handshakes. """
+        """Maintain a persistent pool of warm media upload sessions to avoid repeated TCP/MTProto handshakes."""
         if not hasattr(self, "_upload_session_pool"):
             self._upload_session_pool = []
             self._upload_pool_lock = asyncio.Lock()
@@ -49,7 +49,7 @@ class SaveFile:
             # Remove any dead/disconnected sessions from the pool
             valid_sessions = []
             for s in self._upload_session_pool:
-                if getattr(s, "is_Started", None) or getattr(s, "is_connected", True):
+                if getattr(s, "is_started", None) or getattr(s, "is_connected", True):
                     valid_sessions.append(s)
                 else:
                     try:
@@ -71,12 +71,12 @@ class SaveFile:
             return self._upload_session_pool[:count]
 
     async def save_file(
-        self,
-        path: Union[str, BinaryIO],
-        file_id: int = None,
+        self: "pyrogram.Client",
+        path: Union[str, PurePath, BinaryIO],
+        file_id: Optional[int] = None,
         file_part: int = 0,
-        progress: Callable = None,
-        progress_args: tuple = ()
+        progress: Optional[Callable] = None,
+        progress_args: tuple = (),
     ):
         """Upload a file onto Telegram servers, without actually sending the message to anyone.
         Useful whenever an InputFile type is required.
@@ -105,13 +105,13 @@ class SaveFile:
                                 file_id=file_id,
                                 file_part=part_index,
                                 file_total_parts=file_total_parts,
-                                bytes=chunk
+                                bytes=chunk,
                             )
                         else:
                             rpc = raw.functions.upload.SaveFilePart(
                                 file_id=file_id,
                                 file_part=part_index,
-                                bytes=chunk
+                                bytes=chunk,
                             )
 
                         await session.invoke(rpc, sleep_threshold=self.sleep_threshold)
@@ -171,7 +171,7 @@ class SaveFile:
             sessions = await self._get_upload_sessions(workers_count)
 
             # Bounded queue prevents loading large files entirely into RAM
-            queue = asyncio.Queue(maxsize=workers_count * 2)
+            queue: asyncio.Queue = asyncio.Queue(maxsize=workers_count * 2)
             workers = [self.loop.create_task(worker(s)) for s in sessions]
 
             is_coro_progress = inspect.iscoroutinefunction(progress) if progress else False
@@ -184,7 +184,7 @@ class SaveFile:
 
                     if not chunk:
                         if not is_big and not is_missing_part:
-                            md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
+                            md5_sum = md5_sum.hexdigest()
                         break
 
                     await queue.put((file_part, chunk))
@@ -202,7 +202,7 @@ class SaveFile:
                             progress,
                             min(file_part * part_size, file_size),
                             file_size,
-                            *progress_args
+                            *progress_args,
                         )
 
                         if is_coro_progress:
@@ -210,6 +210,13 @@ class SaveFile:
                         else:
                             await self.loop.run_in_executor(self.executor, func)
             except StopTransmission:
+                # Drain pending queue items so sentinel puts never block on cancellation
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
                 raise
             finally:
                 if close_fp:
@@ -222,18 +229,18 @@ class SaveFile:
                 await asyncio.gather(*workers, return_exceptions=True)
 
             if is_missing_part:
-                return
+                return None
 
             if is_big:
                 return raw.types.InputFileBig(
                     id=file_id,
                     parts=file_total_parts,
-                    name=file_name
+                    name=file_name,
                 )
             else:
                 return raw.types.InputFile(
                     id=file_id,
                     parts=file_total_parts,
                     name=file_name,
-                    md5_checksum=md5_sum
+                    md5_checksum=md5_sum,
                 )
