@@ -140,14 +140,34 @@ class SQLiteStorage(Storage):
                 """
             )
 
-    async def update_peers(self, peers: List[Tuple[int, int, str, str, str]]):
-        """(id, access_hash, type, username, phone_number)"""
+    async def update_peers(self, peers: List[Tuple[int, int, str, Any, str]]):
+        """(id, access_hash, type, username | [usernames] | None, phone_number)"""
+        rows = []
+        all_usernames = []
+
+        for peer_id, access_hash, peer_type, username, phone_number in peers:
+            if isinstance(username, (list, tuple)):
+                names = [u.lower() for u in username if u]
+            elif username:
+                names = [username.lower()]
+            else:
+                names = []
+
+            primary = names[0] if names else None
+            rows.append((peer_id, access_hash, peer_type, primary, phone_number))
+
+            if names:
+                all_usernames.append((peer_id, names))
+
         with self.conn:
             self.conn.executemany(
                 "REPLACE INTO peers (id, access_hash, type, username, phone_number) "
                 "VALUES (?, ?, ?, ?, ?)",
-                peers,
+                rows,
             )
+
+        if all_usernames:
+            await self.update_usernames(all_usernames)
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         """Update collectible/multiple usernames for given peer IDs."""
