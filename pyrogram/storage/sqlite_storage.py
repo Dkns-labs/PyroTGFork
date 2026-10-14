@@ -1,10 +1,5 @@
 #  Pyrogram - Telegram MTProto API Client Library for Python
 #  Copyright (C) 2017-present Dan <https://github.com/delivrance>
-#  Copyright (C) 2017-present bakatrouble <https://github.com/bakatrouble>
-#  Copyright (C) 2017-present cavallium <https://github.com/cavallium>
-#  Copyright (C) 2017-present andrew-ld <https://github.com/andrew-ld>
-#  Copyright (C) 2017-present 01101sam <https://github.com/01101sam>
-#  Copyright (C) 2017-present KurimuzonAkuma <https://github.com/KurimuzonAkuma>
 #
 #  This file is part of Pyrogram.
 #
@@ -21,23 +16,19 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
-import base64
 import inspect
 import logging
 import sqlite3
-import struct
 import time
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Tuple
 
 from pyrogram import raw
 from .storage import Storage
 from .. import utils
 
 log = logging.getLogger(__name__)
-
 
 # language=SQLite
 SCHEMA = """
@@ -65,7 +56,7 @@ CREATE TABLE usernames
 (
     id       INTEGER,
     username TEXT,
-    FOREIGN KEY (id) REFERENCES peers(id)
+    FOREIGN KEY (id) REFERENCES peers (id)
 );
 
 CREATE TABLE update_state
@@ -77,19 +68,15 @@ CREATE TABLE update_state
     seq  INTEGER
 );
 
-CREATE TABLE version
-(
-    number INTEGER PRIMARY KEY
-);
-
-CREATE INDEX IF NOT EXISTS idx_peers_id ON peers (id);
-CREATE INDEX IF NOT EXISTS idx_peers_phone_number ON peers (phone_number);
-CREATE INDEX IF NOT EXISTS idx_usernames_id ON usernames (id);
-CREATE INDEX IF NOT EXISTS idx_usernames_username ON usernames (username);
+CREATE INDEX idx_peers_id ON peers (id);
+CREATE INDEX idx_peers_phone_number ON peers (phone_number);
+CREATE INDEX idx_usernames_username ON usernames (username);
+CREATE INDEX idx_usernames_id ON usernames (id);
 
 CREATE TRIGGER trg_peers_last_update_on
     AFTER UPDATE
     ON peers
+    FOR EACH ROW
 BEGIN
     UPDATE peers
     SET last_update_on = CAST(STRFTIME('%s', 'now') AS INTEGER)
@@ -120,118 +107,50 @@ def get_input_peer(peer_id: int, access_hash: int, peer_type: str):
 
 
 class SQLiteStorage(Storage):
-    VERSION = 6
+    VERSION = 4
     USERNAME_TTL = 8 * 60 * 60
     FILE_EXTENSION = ".session"
+    PEER_CACHE_CAPACITY = 20000
 
-    def __init__(
-        self,
-        name: str,
-        workdir: Path,
-        session_string: Optional[str] = None,
-        in_memory: Optional[bool] = False,
-        use_wal: Optional[bool] = True,
-    ):
+    def __init__(self, name: str, workdir: Path, session_string: str = None, in_memory: bool = False):
         super().__init__(name)
 
-        self._executor = None
-        self.loop = utils.get_event_loop()
-        self.conn = None  # type: sqlite3.Connection | None
-
-        self.session_string = session_string.strip() if isinstance(session_string, str) else session_string
+        self.database = workdir / (self.name + self.FILE_EXTENSION)
+        self.session_string = session_string
         self.in_memory = in_memory
-        self.use_wal = use_wal
 
-        if self.in_memory:
-            self.database = ":memory:"
-        else:
-            self.database = workdir / (self.name + self.FILE_EXTENSION)
+        self.conn: sqlite3.Connection = None
 
-    @property
-    def executor(self):
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(1)
-        return self._executor
+        # High-speed in-memory LRU caches to avoid hitting SQLite on every RPC call
+        self._peer_id_cache: OrderedDict[int, Any] = OrderedDict()
+        self._peer_username_cache: OrderedDict[str, Tuple[Any, int]] = OrderedDict()
+        self._meta_cache = {}
 
-    def _vacuum(self):
-        with self.conn:
-            self.conn.execute("VACUUM")
+    def _apply_pragmas(self):
+        """Configure SQLite for high-concurrency, non-blocking WAL performance."""
+        if not self.in_memory:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA cache_size=-64000")      # 64 MB page cache
+        self.conn.execute("PRAGMA mmap_size=134217728")   # 128 MB memory-mapped I/O
+        self.conn.execute("PRAGMA busy_timeout=5000")
 
-    def _update_from_one_impl(self):
-        with self.conn:
-            self.conn.execute("DELETE FROM peers")
+    def _cache_peer_id(self, peer_id: int, input_peer: Any):
+        if peer_id in self._peer_id_cache:
+            self._peer_id_cache.move_to_end(peer_id)
+        self._peer_id_cache[peer_id] = input_peer
+        if len(self._peer_id_cache) > self.PEER_CACHE_CAPACITY:
+            self._peer_id_cache.popitem(last=False)
 
-    def _update_from_two_impl(self):
-        with self.conn:
-            self.conn.execute("ALTER TABLE sessions ADD api_id INTEGER")
+    def _cache_peer_username(self, username: str, input_peer: Any, last_update_on: int):
+        if username in self._peer_username_cache:
+            self._peer_username_cache.move_to_end(username)
+        self._peer_username_cache[username] = (input_peer, last_update_on)
+        if len(self._peer_username_cache) > self.PEER_CACHE_CAPACITY:
+            self._peer_username_cache.popitem(last=False)
 
-    def _update_from_three_impl(self):
-        with self.conn:
-            self.conn.executescript("""
-CREATE TABLE usernames
-(
-    id       INTEGER,
-    username TEXT,
-    FOREIGN KEY (id) REFERENCES peers(id)
-);
-
-CREATE INDEX idx_usernames_username ON usernames (username);
-""")
-
-    def _update_from_four_impl(self):
-        with self.conn:
-            self.conn.executescript("""
-CREATE TABLE update_state
-(
-    id   INTEGER PRIMARY KEY,
-    pts  INTEGER,
-    qts  INTEGER,
-    date INTEGER,
-    seq  INTEGER
-);
-""")
-
-    def _update_from_five_impl(self):
-        with self.conn:
-            self.conn.executescript("CREATE INDEX idx_usernames_id ON usernames (id);")
-
-    async def update(self):
-        version = await self.version()
-
-        if version == 1:
-            await self.loop.run_in_executor(self.executor, self._update_from_one_impl)
-            version += 1
-
-        if version == 2:
-            await self.loop.run_in_executor(self.executor, self._update_from_two_impl)
-            version += 1
-
-        if version == 3:
-            await self.loop.run_in_executor(self.executor, self._update_from_three_impl)
-            version += 1
-
-        if version == 4:
-            await self.loop.run_in_executor(self.executor, self._update_from_four_impl)
-            version += 1
-
-        if version == 5:
-            await self.loop.run_in_executor(self.executor, self._update_from_five_impl)
-            version += 1
-
-        await self.version(version)
-
-    def _connect_impl(self, path):
-        self.conn = sqlite3.connect(str(path), timeout=1, check_same_thread=False)
-
-        with self.conn:
-            if self.use_wal:
-                self.conn.execute("PRAGMA journal_mode=WAL").close()
-            else:
-                self.conn.execute("PRAGMA journal_mode=DELETE").close()
-            self.conn.execute("PRAGMA synchronous=NORMAL").close()
-            self.conn.execute("PRAGMA temp_store=1").close()
-
-    def _create_impl(self):
+    def create(self):
         with self.conn:
             self.conn.executescript(SCHEMA)
 
@@ -245,175 +164,232 @@ CREATE TABLE update_state
                 (2, None, None, None, 0, None, None)
             )
 
-    async def _unpack_if_session_string(self):
-        if not self.session_string:
-            return
+    def update(self, version: int):
+        if version == 1:
+            with self.conn:
+                self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS update_state ("
+                    "id INTEGER PRIMARY KEY, "
+                    "pts INTEGER, "
+                    "qts INTEGER, "
+                    "date INTEGER, "
+                    "seq INTEGER)"
+                )
+            version += 1
 
-        string_length = len(self.session_string)
-        b64_string_unpack = base64.urlsafe_b64decode(self.session_string + "=" * (-string_length % 4))
+        if version == 2:
+            with self.conn:
+                self.conn.execute("ALTER TABLE sessions ADD api_id INTEGER")
+            version += 1
 
-        # Old format
-        if string_length in [self.SESSION_STRING_SIZE, self.SESSION_STRING_SIZE_64]:
-            if string_length == self.SESSION_STRING_SIZE:
-                string_format = self.OLD_SESSION_STRING_FORMAT
-            else:
-                string_format = self.OLD_SESSION_STRING_FORMAT_64
+        if version == 3:
+            with self.conn:
+                self.conn.executescript(
+                    """
+                    CREATE TABLE usernames
+                    (
+                        id       INTEGER,
+                        username TEXT,
+                        FOREIGN KEY (id) REFERENCES peers (id)
+                    );
 
-            dc_id, test_mode, auth_key, user_id, is_bot = struct.unpack(string_format, b64_string_unpack)
+                    INSERT INTO usernames (id, username)
+                    SELECT id, username FROM peers WHERE username IS NOT NULL;
 
-            await self.dc_id(dc_id)
-            await self.test_mode(test_mode)
-            await self.auth_key(auth_key)
-            await self.user_id(user_id)
-            await self.is_bot(is_bot)
-            await self.date(0)
+                    CREATE INDEX idx_usernames_username ON usernames (username);
+                    CREATE INDEX idx_usernames_id ON usernames (id);
 
-            log.warning(
-                "You are using an old session string format. Use export_session_string to update"
-            )
-            return
+                    CREATE TABLE peers_new
+                    (
+                        id             INTEGER PRIMARY KEY,
+                        access_hash    INTEGER,
+                        type           INTEGER NOT NULL,
+                        phone_number   TEXT,
+                        last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
+                    );
 
-        dc_id, api_id, test_mode, auth_key, user_id, is_bot = struct.unpack(self.SESSION_STRING_FORMAT, b64_string_unpack)
+                    INSERT INTO peers_new (id, access_hash, type, phone_number, last_update_on)
+                    SELECT id, access_hash, type, phone_number, last_update_on FROM peers;
 
-        await self.dc_id(dc_id)
-        await self.api_id(api_id)
-        await self.test_mode(test_mode)
-        await self.auth_key(auth_key)
-        await self.user_id(user_id)
-        await self.is_bot(is_bot)
-        await self.date(0)
+                    DROP TABLE peers;
 
-    async def create(self):
-        return await self.loop.run_in_executor(self.executor, self._create_impl)
+                    ALTER TABLE peers_new RENAME TO peers;
+
+                    CREATE INDEX idx_peers_id ON peers (id);
+                    CREATE INDEX idx_peers_phone_number ON peers (phone_number);
+
+                    CREATE TRIGGER trg_peers_last_update_on
+                        AFTER UPDATE
+                        ON peers
+                        FOR EACH ROW
+                    BEGIN
+                        UPDATE peers
+                        SET last_update_on = CAST(STRFTIME('%s', 'now') AS INTEGER)
+                        WHERE id = NEW.id;
+                    END;
+                    """
+                )
+            version += 1
+
+        with self.conn:
+            self.conn.execute("UPDATE version SET number = ?", (version,))
 
     async def open(self):
+        path = self.database
         if self.in_memory:
-            conn_func = partial(sqlite3.connect, self.database, timeout=1, check_same_thread=False)
-            self.conn = await self.loop.run_in_executor(self.executor, conn_func)
-            await self.create()
-            await self._unpack_if_session_string()
+            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._apply_pragmas()
+            self.create()
+
+            if self.session_string:
+                # Old format
+                if len(self.session_string) in [self.SESSION_STRING_SIZE, self.SESSION_STRING_SIZE_64]:
+                    dc_id, test_mode, auth_key, user_id, is_bot = self.unpack_old(self.session_string)
+                    await self.dc_id(dc_id)
+                    await self.test_mode(test_mode)
+                    await self.auth_key(auth_key)
+                    await self.user_id(user_id)
+                    await self.is_bot(is_bot)
+                    return
+
+                dc_id, api_id, test_mode, auth_key, user_id, is_bot = self.unpack(self.session_string)
+
+                await self.dc_id(dc_id)
+                await self.api_id(api_id)
+                await self.test_mode(test_mode)
+                await self.auth_key(auth_key)
+                await self.user_id(user_id)
+                await self.is_bot(is_bot)
+
             return
 
-        path = self.database
         file_exists = isinstance(path, Path) and path.is_file()
 
-        self.executor.submit(self._connect_impl, path).result()
+        self.conn = sqlite3.connect(str(path), timeout=5, check_same_thread=False)
+        self._apply_pragmas()
 
         if not file_exists:
-            await self.create()
+            self.create()
         else:
-            await self.update()
+            with self.conn:
+                version = self.conn.execute("SELECT number FROM version").fetchone()[0]
 
-        await self._unpack_if_session_string()
+            if version < self.VERSION:
+                self.update(version)
 
-        await self.loop.run_in_executor(self.executor, self._vacuum)
+        with self.conn:
+            self.conn.execute("VACUUM")
 
     async def save(self):
         await self.date(int(time.time()))
-        await self.loop.run_in_executor(self.executor, self.conn.commit)
+        self.conn.commit()
 
     async def close(self):
-        await self.loop.run_in_executor(self.executor, self.conn.close)
-        self.executor.shutdown()
-        self._executor = None 
-        
+        self.conn.close()
+        self._peer_id_cache.clear()
+        self._peer_username_cache.clear()
+        self._meta_cache.clear()
+
     async def delete(self):
         if not self.in_memory:
-            Path(self.database).unlink()
+            Path(self.database).unlink(missing_ok=True)
+            Path(str(self.database) + "-wal").unlink(missing_ok=True)
+            Path(str(self.database) + "-shm").unlink(missing_ok=True)
 
-    def _update_peers_impl(self, peers):
-        with self.conn:
-            peers_data = []
-            usernames_data = []
-            ids_to_delete = []
-            for id, access_hash, type, usernames, phone_number in peers:
-                ids_to_delete.append((id,))
-                peers_data.append((id, access_hash, type, phone_number))
+    async def update_peers(self, peers: List[Tuple[int, int, str, List[str], str]]):
+        if not peers:
+            return
 
-                if usernames:
-                    usernames_data.extend([(id, username) for username in usernames])
+        now = int(time.time())
+        peers_data = []
+        delete_usernames_data = []
+        insert_usernames_data = []
 
+        for peer_id, access_hash, peer_type, usernames, phone_number in peers:
+            peers_data.append((peer_id, access_hash, peer_type, phone_number))
+            delete_usernames_data.append((peer_id,))
+
+            try:
+                input_peer = get_input_peer(peer_id, access_hash, peer_type)
+                self._cache_peer_id(peer_id, input_peer)
+            except ValueError:
+                input_peer = None
+
+            if usernames:
+                for username in usernames:
+                    insert_usernames_data.append((peer_id, username))
+                    if input_peer is not None:
+                        self._cache_peer_username(username, input_peer, now)
+
+        self.conn.executemany(
+            "REPLACE INTO peers (id, access_hash, type, phone_number) VALUES (?, ?, ?, ?)",
+            peers_data
+        )
+        self.conn.executemany(
+            "DELETE FROM usernames WHERE id = ?",
+            delete_usernames_data
+        )
+        if insert_usernames_data:
             self.conn.executemany(
-                "REPLACE INTO peers (id, access_hash, type, phone_number) VALUES (?, ?, ?, ?)",
-                peers_data
+                "REPLACE INTO usernames VALUES (?, ?)",
+                insert_usernames_data
             )
+        self.conn.commit()
 
-            self.conn.executemany(
-                "DELETE FROM usernames WHERE id = ?",
-                ids_to_delete
-            )
-
-            if usernames_data:
-                self.conn.executemany(
-                    "REPLACE INTO usernames (id, username) VALUES (?, ?)",
-                    usernames_data
-                )
-
-    async def update_peers(self, peers: list[tuple[int, int, str, list[str], str]]):
-        return await self.loop.run_in_executor(self.executor, self._update_peers_impl, peers)
-
-    def _update_usernames_impl(self, usernames: list[tuple[int, list[str]]]):
-        with self.conn:
-            self.conn.executemany("DELETE FROM usernames WHERE id = ?", [(id,) for id, _ in usernames])
-
-            self.conn.executemany(
-                "REPLACE INTO usernames (id, username) VALUES (?, ?)",
-                [(id, username) for id, usernames in usernames for username in usernames],
-            )
-
-    async def update_usernames(self, usernames: list[tuple[int, list[str]]]):
-        return await self.loop.run_in_executor(self.executor, self._update_usernames_impl, usernames)
-
-    def _update_state_impl(self, value: tuple[int, int, int, int, int] = object):
+    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
         if value == object:
             return self.conn.execute(
-                "SELECT id, pts, qts, date, seq FROM update_state "
-                "ORDER BY date ASC"
+                "SELECT id, pts, qts, date, seq FROM update_state ORDER BY id ASC"
             ).fetchall()
         else:
-            with self.conn:
-                if isinstance(value, int):
-                    self.conn.execute(
-                        "DELETE FROM update_state WHERE id = ?",
-                        (value,)
-                    )
-                else:
-                    self.conn.execute(
-                        "REPLACE INTO update_state (id, pts, qts, date, seq)"
-                        "VALUES (?, ?, ?, ?, ?)",
-                        value
-                    )
-
-    async def update_state(self, value: tuple[int, int, int, int, int] = object):
-        return await self.loop.run_in_executor(self.executor, self._update_state_impl, value)
-
-    def _get_peer_by_id_impl(self, peer_id: int):
-        with self.conn:
-            return self.conn.execute(
-                "SELECT id, access_hash, type FROM peers WHERE id = ?",
-                (peer_id,)
-            ).fetchone()
+            if isinstance(value, int):
+                self.conn.execute(
+                    "DELETE FROM update_state WHERE id = ?",
+                    (value,)
+                )
+            else:
+                self.conn.execute(
+                    "REPLACE INTO update_state VALUES (?, ?, ?, ?, ?)",
+                    value
+                )
+            self.conn.commit()
 
     async def get_peer_by_id(self, peer_id: int):
-        r = await self.loop.run_in_executor(self.executor, self._get_peer_by_id_impl, peer_id)
+        cached = self._peer_id_cache.get(peer_id)
+        if cached is not None:
+            self._peer_id_cache.move_to_end(peer_id)
+            return cached
+
+        r = self.conn.execute(
+            "SELECT id, access_hash, type FROM peers WHERE id = ?",
+            (peer_id,)
+        ).fetchone()
 
         if r is None:
             raise KeyError(f"ID not found: {peer_id}")
 
-        return get_input_peer(*r)
-
-    def _get_peer_by_username_impl(self, username: str):
-        with self.conn:
-            return self.conn.execute(
-                "SELECT p.id, p.access_hash, p.type, p.last_update_on FROM peers p "
-                "JOIN usernames u ON p.id = u.id "
-                "WHERE u.username = ? "
-                "ORDER BY p.last_update_on DESC",
-                (username,)
-            ).fetchone()
+        input_peer = get_input_peer(*r)
+        self._cache_peer_id(peer_id, input_peer)
+        return input_peer
 
     async def get_peer_by_username(self, username: str):
-        r = await self.loop.run_in_executor(self.executor, self._get_peer_by_username_impl, username)
+        username_key = username.lower()
+        cached = self._peer_username_cache.get(username_key)
+        if cached is not None:
+            input_peer, last_update_on = cached
+            if abs(time.time() - last_update_on) <= self.USERNAME_TTL:
+                self._peer_username_cache.move_to_end(username_key)
+                return input_peer
+            else:
+                del self._peer_username_cache[username_key]
+
+        r = self.conn.execute(
+            "SELECT p.id, p.access_hash, p.type, p.last_update_on FROM peers p "
+            "JOIN usernames u ON p.id = u.id "
+            "WHERE u.username = ? "
+            "ORDER BY p.last_update_on DESC",
+            (username_key,)
+        ).fetchone()
 
         if r is None:
             raise KeyError(f"Username not found: {username}")
@@ -421,81 +397,66 @@ CREATE TABLE update_state
         if abs(time.time() - r[3]) > self.USERNAME_TTL:
             raise KeyError(f"Username expired: {username}")
 
-        return get_input_peer(*r[:3])
-
-    def _get_peer_by_phone_number_impl(self, phone_number: str):
-        with self.conn:
-            return self.conn.execute(
-                "SELECT id, access_hash, type FROM peers WHERE phone_number = ?",
-                (phone_number,)
-            ).fetchone()
+        input_peer = get_input_peer(*r[:3])
+        self._cache_peer_username(username_key, input_peer, r[3])
+        return input_peer
 
     async def get_peer_by_phone_number(self, phone_number: str):
-        r = await self.loop.run_in_executor(self.executor, self._get_peer_by_phone_number_impl, phone_number)
+        r = self.conn.execute(
+            "SELECT id, access_hash, type FROM peers WHERE phone_number = ?",
+            (phone_number,)
+        ).fetchone()
 
         if r is None:
             raise KeyError(f"Phone number not found: {phone_number}")
 
-        return get_input_peer(*r)
+        input_peer = get_input_peer(*r)
+        self._cache_peer_id(r[0], input_peer)
+        return input_peer
 
-    def _get_impl(self, attr: str):
-        with self.conn:
-            return self.conn.execute(f"SELECT {attr} FROM sessions").fetchone()[0]
-
-    # async def _get(self, attr: str):
-    #     return await self.loop.run_in_executor(self.executor, self._get_impl, attr)
-
-    async def _get(self):
+    def _get(self):
         attr = inspect.stack()[2].function
-        return await self.loop.run_in_executor(self.executor, self._get_impl, attr)
+        if attr in self._meta_cache:
+            return self._meta_cache[attr]
 
-    def _set_impl(self, attr: str, value: any):
-        with self.conn:
-            return self.conn.execute(f"UPDATE sessions SET {attr} = ?", (value,))
+        val = self.conn.execute(f"SELECT {attr} FROM sessions").fetchone()[0]
+        self._meta_cache[attr] = val
+        return val
 
-    # async def _set(self, attr: str, value: Any):
-    #     return await self.loop.run_in_executor(self.executor, self._set_impl, attr, value)
-
-    async def _set(self, value: Any):
+    def _set(self, value: Any):
         attr = inspect.stack()[2].function
+        self._meta_cache[attr] = value
 
-        return await self.loop.run_in_executor(self.executor, self._set_impl, attr, value)
-
-    async def _accessor(self, value: Any = object):
-        # return await self._get(attr) if value == object else await self._set(attr, value)
-        return await self._get() if value == object else await self._set(value)
-    
-    def _get_version_impl(self):
         with self.conn:
-            return self.conn.execute("SELECT number FROM version").fetchone()[0]
+            self.conn.execute(f"UPDATE sessions SET {attr} = ?", (value,))
 
-    def _set_version_impl(self, value):
-        with self.conn:
-            return self.conn.execute("UPDATE version SET number = ?", (value,))
+    def _accessor(self, value: Any = object):
+        return self._get() if value == object else self._set(value)
 
     async def dc_id(self, value: int = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def api_id(self, value: int = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def test_mode(self, value: bool = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def auth_key(self, value: bytes = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def date(self, value: int = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def user_id(self, value: int = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def is_bot(self, value: bool = object):
-        return await self._accessor(value)
+        return self._accessor(value)
 
     async def version(self, value: int = object):
         if value == object:
-            return await self.loop.run_in_executor(self.executor, self._get_version_impl)
+            return self.conn.execute("SELECT number FROM version").fetchone()[0]
         else:
-            return await self.loop.run_in_executor(self.executor, self._set_version_impl, value)
+            with self.conn:
+                self.conn.execute("UPDATE version SET number = ?", (value,))
