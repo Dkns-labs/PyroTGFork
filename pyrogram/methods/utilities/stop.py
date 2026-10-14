@@ -16,7 +16,9 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+import asyncio
 import pyrogram
+from pyrogram import raw
 
 
 class Stop:
@@ -27,39 +29,24 @@ class Stop:
         """Stop the Client.
 
         This method disconnects the client from Telegram and stops the underlying tasks.
-
-        Parameters:
-            block (``bool``, *optional*):
-                Blocks the code execution until the client has been stopped. It is useful with ``block=False`` in case
-                you want to stop the own client *within* a handler in order not to cause a deadlock.
-                Defaults to True.
-
-        Returns:
-            :obj:`~pyrogram.Client`: The stopped client itself.
-
-        Raises:
-            ConnectionError: In case you try to stop an already stopped client.
-
-        Example:
-            .. code-block:: python
-
-                from pyrogram import Client
-
-                app = Client("my_account")
-
-
-                async def main():
-                    await app.start()
-                    ...  # Invoke API methods
-                    await app.stop()
-
-
-                app.run(main())
         """
-
         async def do_it():
+            if not self.is_initialized:
+                raise ConnectionError("Client has not been initialized yet")
+
+            if self.updates_watchdog_task is not None:
+                self.updates_watchdog_event.set()
+                await self.updates_watchdog_task
+
+            self.executor.shutdown(wait=block)
+
+            if not self.no_updates:
+                await self.dispatcher.stop()
+
             await self.terminate()
             await self.disconnect()
+
+            self.is_initialized = False
 
         if block:
             await do_it()
@@ -67,3 +54,33 @@ class Stop:
             self.loop.create_task(do_it())
 
         return self
+
+    async def disconnect(
+        self: "pyrogram.Client"
+    ):
+        """Disconnect the Client from Telegram and close all pooled media sessions concurrently."""
+        if not self.is_connected:
+            raise ConnectionError("Client is already disconnected")
+
+        if self.takeout_id:
+            await self.invoke(
+                raw.functions.account.FinishTakeoutSession()
+            )
+
+        # Concurrently close all cached download sessions and pooled upload sessions
+        close_tasks = [i.stop() for i in self.media_sessions.values()]
+        if hasattr(self, "_upload_session_pool") and self._upload_session_pool:
+            close_tasks.extend(s.stop() for s in self._upload_session_pool)
+
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+
+        self.media_sessions.clear()
+        if hasattr(self, "_upload_session_pool"):
+            self._upload_session_pool.clear()
+
+        await self.session.stop()
+        await self.storage.save()
+        await self.storage.close()
+
+        self.is_connected = False
