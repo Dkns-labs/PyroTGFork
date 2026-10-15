@@ -17,7 +17,7 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures.thread import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import functools
@@ -106,6 +106,11 @@ class Client(Methods):
     MAX_CONCURRENT_TRANSMISSIONS = 8
     MAX_CACHE_SIZE = 10000
     DISK_BUFFER_SIZE = 1024 * 1024  # 1 MB disk write buffer
+
+    # Parallel download tuning: connections per DC, and in-flight GetFile requests per connection
+    # (override without code changes: PYROGRAM_DL_CONNECTIONS / PYROGRAM_DL_DEPTH env vars)
+    DOWNLOAD_CONNECTIONS = max(1, int(os.environ.get("PYROGRAM_DL_CONNECTIONS", 6)))
+    DOWNLOAD_PIPELINE_DEPTH = max(1, int(os.environ.get("PYROGRAM_DL_DEPTH", 3)))
 
     mimetypes = MimeTypes()
     mimetypes.readfp(StringIO(mime_types))
@@ -210,6 +215,7 @@ class Client(Methods):
         self.session = None
 
         self.media_sessions = {}
+        self.media_session_pool = {}  # dc_id -> [Session, ...] extra parallel download connections
         self.media_sessions_lock = asyncio.Lock()
 
         self.save_file_semaphore = asyncio.Semaphore(
@@ -1127,6 +1133,39 @@ class Client(Methods):
             self.media_sessions[dc_id] = session
             return session
 
+    async def _get_media_sessions(self, dc_id: int, count: int) -> list:
+        """Return up to `count` warm media sessions for a DC (the first is the regular cached one).
+
+        Extra sessions reuse the same auth key, so no new authorization export/import is needed.
+        """
+        first = await self._get_media_session(dc_id)
+
+        async with self.media_sessions_lock:
+            pool = self.media_session_pool.get(dc_id)
+
+            if not pool or pool[0] is not first:
+                pool = self.media_session_pool[dc_id] = [first]
+
+            missing = count - len(pool)
+
+            if missing > 0:
+                test_mode = await self.storage.test_mode()
+                new_sessions = [
+                    Session(self, dc_id, first.auth_key, test_mode, is_media=True)
+                    for _ in range(missing)
+                ]
+                results = await asyncio.gather(
+                    *(s.start() for s in new_sessions), return_exceptions=True
+                )
+
+                for s, res in zip(new_sessions, results):
+                    if isinstance(res, BaseException):
+                        log.warning("Extra media session failed to start: %r", res)
+                    else:
+                        pool.append(s)
+
+            return pool[:count]
+
     async def get_file(
         self,
         file_id: FileId,
@@ -1207,38 +1246,61 @@ class Client(Methods):
                         offset=offset_bytes,
                         limit=chunk_size,
                     ),
+                    timeout=Session.MEDIA_WAIT_TIMEOUT,
                     sleep_threshold=self.sleep_threshold,
                 )
 
                 if isinstance(r, raw.types.upload.File):
-                    while True:
-                        chunk = r.bytes
-                        chunk_len = len(chunk)
+                    # Parallel pipeline: keep a window of GetFile requests in flight,
+                    # spread round-robin over several connections, yield strictly in order.
+                    sessions = await self._get_media_sessions(
+                        dc_id, self.DOWNLOAD_CONNECTIONS
+                    )
+                    window = len(sessions) * self.DOWNLOAD_PIPELINE_DEPTH
+                    pending = deque()
+                    next_offset = offset_bytes + chunk_size
+                    scheduled = 1  # the first chunk was already fetched
 
-                        current += 1
-                        offset_bytes += chunk_len
+                    def top_up():
+                        nonlocal next_offset, scheduled
 
-                        is_last = (
-                            chunk_len < chunk_size
-                            or current >= total
-                            or (file_size > 0 and offset_bytes >= file_size)
-                        )
-
-                        # Prefetch the next chunk immediately in the background
-                        next_task = None
-                        if not is_last:
-                            next_task = self.loop.create_task(
-                                session.invoke(
+                        while (
+                            len(pending) < window
+                            and scheduled < total
+                            and (file_size == 0 or next_offset < file_size)
+                        ):
+                            task = self.loop.create_task(
+                                sessions[scheduled % len(sessions)].invoke(
                                     raw.functions.upload.GetFile(
                                         location=location,
-                                        offset=offset_bytes,
+                                        offset=next_offset,
                                         limit=chunk_size,
                                     ),
+                                    timeout=Session.MEDIA_WAIT_TIMEOUT,
                                     sleep_threshold=self.sleep_threshold,
                                 )
                             )
+                            pending.append(task)
+                            next_offset += chunk_size
+                            scheduled += 1
 
-                        try:
+                    try:
+                        while True:
+                            chunk = r.bytes
+                            chunk_len = len(chunk)
+
+                            current += 1
+                            offset_bytes += chunk_len
+
+                            is_last = (
+                                chunk_len < chunk_size
+                                or current >= total
+                                or (file_size > 0 and offset_bytes >= file_size)
+                            )
+
+                            if not is_last:
+                                top_up()
+
                             yield chunk
 
                             if progress:
@@ -1256,15 +1318,18 @@ class Client(Methods):
                                     await self.loop.run_in_executor(
                                         self.executor, func
                                     )
-                        except BaseException:
-                            if next_task and not next_task.done():
-                                next_task.cancel()
-                            raise
 
-                        if is_last:
-                            break
+                            if is_last:
+                                break
 
-                        r = await next_task
+                            r = await pending.popleft()
+                    finally:
+                        # Drop speculative requests (EOF, cancel, error) without leaking warnings
+                        for task in pending:
+                            task.cancel()
+                            task.add_done_callback(
+                                lambda t: t.cancelled() or t.exception()
+                            )
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
                     test_mode = await self.storage.test_mode()
