@@ -114,9 +114,15 @@ class SaveFile:
                                 bytes=chunk,
                             )
 
-                        await session.invoke(rpc, sleep_threshold=self.sleep_threshold)
+                        await session.invoke(
+                            rpc,
+                            timeout=Session.MEDIA_WAIT_TIMEOUT,
+                            sleep_threshold=self.sleep_threshold,
+                        )
                     except Exception as e:
-                        log.exception(e)
+                        # Remember the failure: a lost part must fail the upload, not be skipped silently
+                        log.error("Upload of part %s failed: %r", data[0], e)
+                        errors.append(e)
                     finally:
                         queue.task_done()
 
@@ -165,14 +171,17 @@ class SaveFile:
             md5_sum = md5() if not is_big and not is_missing_part else None
 
             # Scale workers dynamically based on part count and client configuration
-            max_workers = max(1, min(16, getattr(self, "max_concurrent_transmissions", 8)))
+            # Parallel upload connections; PYROGRAM_UL_WORKERS overrides (1-32), useful on high-latency links
+            max_workers = int(os.environ.get("PYROGRAM_UL_WORKERS", 0)) or getattr(self, "max_concurrent_transmissions", 8)
+            max_workers = max(1, min(32, max_workers))
             workers_count = 1 if is_missing_part else min(max_workers, file_total_parts)
 
             sessions = await self._get_upload_sessions(workers_count)
 
             # Bounded queue prevents loading large files entirely into RAM
             queue: asyncio.Queue = asyncio.Queue(maxsize=workers_count * 2)
-            workers = [self.loop.create_task(worker(s)) for s in sessions]
+            errors: list = []
+            workers =[self.loop.create_task(worker(s)) for s in sessions]
 
             is_coro_progress = inspect.iscoroutinefunction(progress) if progress else False
 
@@ -188,6 +197,9 @@ class SaveFile:
                         break
 
                     await queue.put((file_part, chunk))
+
+                    if errors:
+                        break
 
                     if md5_sum is not None:
                         md5_sum.update(chunk)
@@ -227,6 +239,9 @@ class SaveFile:
                     await queue.put(None)
 
                 await asyncio.gather(*workers, return_exceptions=True)
+
+            if errors:
+                raise errors[0]
 
             if is_missing_part:
                 return None
