@@ -17,5 +17,6 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 from .data_center import DataCenter
+from .dc_router import DCRouter
 from .msg_factory import MsgFactory
 from .msg_id import MsgId
