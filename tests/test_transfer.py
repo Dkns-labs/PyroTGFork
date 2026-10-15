@@ -23,6 +23,8 @@ inject failures, and the transport tests talk to a loopback server.
 """
 
 import asyncio
+import hashlib
+import io
 import os
 import random
 import socket
@@ -152,9 +154,27 @@ def test_connection_gives_up_after_all_endpoints_fail(monkeypatch):
 # ---------------------------------------------------------------------------------------------
 
 def test_obfuscated_sends_stay_ordered_with_many_crypto_workers(monkeypatch):
+    frames = {i: bytes([i % 251]) * (4 * (1 + i % 40)) for i in range(300)}
+    run_obfuscated_send(monkeypatch, frames)
+
+
+def test_obfuscated_sends_stay_ordered_when_small_frames_are_encrypted_inline(monkeypatch):
+    # With a native backend small frames skip the executor while big ones still use it; the
+    # keystream must stay in order across both paths. (NATIVE is switched on for the test; the
+    # cipher itself is whatever backend the test machine has.)
+    monkeypatch.setattr(aes, "NATIVE", True)
+    monkeypatch.setattr(aes, "INLINE_LIMIT", 4096)
+
+    frames = {
+        i: bytes([i % 251]) * (4 * (1 + i % 40) if i % 5 else 4 * 3000)  # every 5th frame is 12 KB
+        for i in range(300)
+    }
+    run_obfuscated_send(monkeypatch, frames)
+
+
+def run_obfuscated_send(monkeypatch, frames):
     monkeypatch.setattr(pyrogram, "crypto_executor", ThreadPoolExecutor(8))
 
-    frames = {i: bytes([i % 251]) * (4 * (1 + i % 40)) for i in range(300)}
     received = []
 
     async def main():
@@ -275,6 +295,8 @@ class FakeSession:
         self.migrate_to = None
         self.error = None
         self.die_after = None
+        self.stall = 0.0
+        self.delay = 0.0  # simulated round-trip time, applied to every request
         self.uploaded = {}
         FakeSession.registry.append(self)
 
@@ -304,9 +326,12 @@ class FakeSession:
                 continue
             break
 
-        await asyncio.sleep(0)
+        await asyncio.sleep(self.delay)
 
         if isinstance(query, raw.functions.upload.GetFile):
+            if self.stall:
+                await asyncio.sleep(self.stall)  # a connection that is alive but has gone silent
+
             if self.migrate_to is not None:
                 raise FileMigrate(value=self.migrate_to)
 
@@ -441,7 +466,8 @@ def test_non_retryable_error_is_not_retried(monkeypatch):
     _, got = run_download(monkeypatch, blob, configure=expired)
 
     assert got == b""  # get_file reports the failure by ending early
-    assert sum(s.calls for s in FakeSession.registry) == 1
+    # Only the first burst of requests went out; none of them was retried
+    assert sum(s.calls for s in FakeSession.registry) <= 2 * Client.DOWNLOAD_PIPELINE_DEPTH
 
 
 def test_dead_cached_session_is_replaced(monkeypatch):
@@ -536,3 +562,515 @@ def test_background_restart_marks_session_dead(monkeypatch):
 
     session = run(main())
     assert isinstance(session.failure, RuntimeError)
+
+
+# ---------------------------------------------------------------------------------------------
+# Offset / limit units, stall hedging, resume, session fixes, socket options
+# ---------------------------------------------------------------------------------------------
+
+def test_offset_and_limit_count_mib_even_for_small_files(monkeypatch):
+    """stream_media() documents 1 MiB units; files <= 25 MB use 512 KB requests on the wire."""
+    blob = os.urandom(10 * MB + 321)
+
+    async def main():
+        client = make_client(monkeypatch)
+        original_init = FakeSession.__init__
+
+        def init(self, *a, **k):
+            original_init(self, *a, **k)
+            self.blobs = {2: blob}
+
+        monkeypatch.setattr(FakeSession, "__init__", init)
+
+        async def create(dc_id_):
+            return FakeSession(client, dc_id_)
+
+        client._create_media_session = create
+
+        async def collect(**kw):
+            out = bytearray()
+            async for chunk in client.get_file(file_id(), len(blob), **kw):
+                out += chunk
+            return bytes(out)
+
+        try:
+            return (
+                await collect(limit=3, offset=2),
+                await collect(offset=8),
+                await collect(limit=1),
+            )
+        finally:
+            await client._cancel_background_work()
+
+    middle, tail, first = run(main())
+
+    assert middle == blob[2 * MB:5 * MB]
+    assert tail == blob[8 * MB:]
+    assert first == blob[:MB]
+
+
+def test_stalled_connection_does_not_stall_the_download(monkeypatch):
+    import time
+
+    monkeypatch.setattr(Client, "DOWNLOAD_HEDGE_AFTER", 0.2)
+    blob = os.urandom(24 * MB + 5)
+    made = []
+
+    def silent(session):
+        if session not in made:  # run_download() configures the first session twice
+            made.append(session)
+        if len(made) == 2:
+            session.stall = 30  # alive, never answers within the test
+
+    started = time.monotonic()
+    _, got = run_download(monkeypatch, blob, configure=silent)
+
+    assert got == blob
+    assert time.monotonic() - started < 10
+    assert made[1].calls >= 1  # the silent connection really was handed work
+
+
+def test_hedging_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(Client, "DOWNLOAD_HEDGE_AFTER", 0)
+    blob = os.urandom(6 * MB + 1)
+    _, got = run_download(monkeypatch, blob)
+
+    assert got == blob
+
+
+def test_hedge_does_not_swallow_errors_when_both_requests_fail(monkeypatch):
+    monkeypatch.setattr(Client, "DOWNLOAD_HEDGE_AFTER", 0.05)
+    blob = os.urandom(2 * MB)
+
+    def broken(session):
+        session.stall = 0.2
+        session.error = BadRequest(value="[400 FILE_REFERENCE_EXPIRED]")
+
+    _, got = run_download(monkeypatch, blob, configure=broken)
+
+    assert got == b""  # reported the usual way: get_file ends early, handle_download notices
+
+
+def test_incomplete_download_resumes_from_last_whole_mib(monkeypatch):
+    blob = os.urandom(8 * MB + 777)
+    calls = []
+
+    async def main():
+        client = make_client(monkeypatch)
+        client.DOWNLOAD_RESUME_DELAY = 0
+
+        async def fake_get_file(fid, size, limit, offset, progress=None, progress_args=()):
+            calls.append(offset)
+            pos = offset * MB
+
+            if len(calls) == 1:  # dies half way through the 4th MiB
+                yield blob[pos:pos + 3 * MB + 100]
+                return
+
+            while pos < len(blob):
+                yield blob[pos:pos + MB]
+                pos += MB
+
+        client.get_file = fake_get_file
+        return await client.handle_download((file_id(), "unused", "f.bin", True, len(blob), None, ()))
+
+    result = run(main())
+
+    assert result.getvalue() == blob
+    assert calls == [0, 3]  # restarted at MiB 3, the torn 100 bytes were discarded
+
+
+def test_incomplete_download_resumes_on_disk_too(monkeypatch, tmp_path):
+    blob = os.urandom(5 * MB + 9)
+    calls = []
+
+    async def main():
+        client = make_client(monkeypatch)
+        client.DOWNLOAD_RESUME_DELAY = 0
+
+        async def fake_get_file(fid, size, limit, offset, progress=None, progress_args=()):
+            calls.append(offset)
+            pos = offset * MB
+
+            if len(calls) <= 2:  # two failures in a row, each after some progress
+                yield blob[pos:pos + MB + 50]
+                return
+
+            while pos < len(blob):
+                yield blob[pos:pos + MB]
+                pos += MB
+
+        client.get_file = fake_get_file
+        return await client.handle_download((file_id(), str(tmp_path), "f.bin", False, len(blob), None, ()))
+
+    path = run(main())
+
+    with open(path, "rb") as f:
+        assert f.read() == blob
+    assert calls == [0, 1, 2]
+    assert not os.path.exists(path + ".temp")
+
+
+def test_download_gives_up_quickly_when_nothing_ever_arrives(monkeypatch, tmp_path):
+    calls = []
+
+    async def main():
+        client = make_client(monkeypatch)
+        client.DOWNLOAD_RESUME_DELAY = 0
+
+        async def fake_get_file(fid, size, limit, offset, progress=None, progress_args=()):
+            calls.append(offset)
+            return
+            yield  # pragma: no cover  (makes this an async generator)
+
+        client.get_file = fake_get_file
+        return await client.handle_download((file_id(), str(tmp_path), "f.bin", False, 4 * MB, None, ()))
+
+    assert run(main()) is None
+    assert len(calls) == 2  # one retry, then a permanent error is assumed
+    assert not any(n.endswith(".temp") for n in os.listdir(tmp_path))
+
+
+def test_download_gives_up_after_max_resumes(monkeypatch):
+    blob = os.urandom(10 * MB)
+    calls = []
+
+    async def main():
+        client = make_client(monkeypatch)
+        client.DOWNLOAD_RESUME_DELAY = 0
+
+        async def fake_get_file(fid, size, limit, offset, progress=None, progress_args=()):
+            calls.append(offset)
+            pos = offset * MB
+            yield blob[pos:pos + MB]  # always makes progress, never finishes
+
+        client.get_file = fake_get_file
+        return await client.handle_download((file_id(), "unused", "f.bin", True, len(blob), None, ()))
+
+    assert run(main()) is None
+    assert len(calls) == Client.DOWNLOAD_RESUMES + 1
+
+
+def test_invoke_retry_keeps_the_callers_sleep_threshold(monkeypatch):
+    from types import SimpleNamespace
+    from pyrogram.errors import FloodWait
+    from pyrogram.session import Session
+
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *a, **k):
+        slept.append(delay)
+        await real_sleep(0)
+
+    async def main():
+        client = SimpleNamespace(sleep_threshold=0, name="t")
+        session = Session(client, 2, b"k" * 256, False, is_media=True)
+        session.is_connected.set()
+        outcomes = [TimeoutError(), FloodWait(value=30), "ok"]
+
+        async def send(query, wait_response=True, timeout=15):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        session.send = send
+        monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+        return await session.invoke(raw.functions.Ping(ping_id=1), retries=2, sleep_threshold=60)
+
+    # Before the fix the retry fell back to the default threshold and re-raised the 30 s wait
+    assert run(main()) == "ok"
+    assert 30 in slept
+
+
+def test_session_keeps_strong_references_to_packet_tasks():
+    from types import SimpleNamespace
+    from pyrogram.session import Session
+
+    async def main():
+        client = SimpleNamespace(loop=asyncio.get_running_loop())
+        session = Session(client, 2, b"k" * 256, False, is_media=True)
+        gate = asyncio.Event()
+
+        async def work():
+            await gate.wait()
+
+        task = session._spawn(work())
+        await asyncio.sleep(0)
+        held = task in session._tasks
+        gate.set()
+        await task
+        await asyncio.sleep(0)
+        return held, task in session._tasks
+
+    held, still_held = run(main())
+    assert held and not still_held
+
+
+def test_failed_start_backs_off_instead_of_spinning(monkeypatch):
+    from types import SimpleNamespace
+    from pyrogram.session import Session
+    import pyrogram.session.session as session_module
+
+    attempts = []
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *a, **k):
+        slept.append(delay)
+        await real_sleep(0)
+
+    class Failing:
+        def __init__(self, *a, **k): pass
+
+        async def connect(self):
+            attempts.append(1)
+            if len(attempts) < 5:
+                raise TimeoutError
+
+        async def send(self, data): pass
+
+        async def recv(self):
+            await real_sleep(3600)
+
+        async def close(self): pass
+
+    async def main():
+        client = SimpleNamespace(
+            loop=asyncio.get_running_loop(), ipv6=False, proxy=None, name="t",
+            device_model="d", app_version="a", system_version="s", lang_code="en",
+        )
+        session = Session(client, 2, b"k" * 256, False, is_media=True, is_cdn=True)
+
+        async def send(*a, **k):
+            return None
+
+        session.send = send
+        monkeypatch.setattr(session_module, "Connection", Failing)
+        monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+        async def stop():
+            session.is_connected.clear()
+
+        session.stop = stop
+        await session.start()
+        session.network_task.cancel()
+        session.ping_task.cancel()
+
+    run(main())
+
+    assert len(attempts) == 5
+    assert [d for d in slept if d >= 0.25][:4] == [0.25, 0.5, 1.0, 2.0]
+
+
+def test_socket_options_make_dead_peers_visible():
+    from pyrogram.connection.transport.tcp.tcp import TCP
+
+    a = socket.socket()
+    try:
+        TCP._tune_socket(a)
+
+        assert a.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+        assert a.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            assert a.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 15
+            assert a.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 3
+
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            assert a.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT) == TCP.USER_TIMEOUT_MS
+    finally:
+        a.close()
+
+
+def server_packet(body, auth_key, session_id, msg_id):
+    """What the server would send: the incoming direction of MTProto 2.0 (x = 8)."""
+    message = raw.core.Message(body, msg_id, 0, len(body.write()))
+    data = bytes(8) + session_id + message.write()
+    padding = os.urandom(-(len(data) + 12) % 16 + 12)
+    msg_key = sha256(auth_key[96:128] + data + padding).digest()[8:24]
+    aes_key, aes_iv = mtproto.kdf(auth_key, msg_key, False)
+    auth_key_id = hashlib.sha1(auth_key).digest()[-8:]
+
+    return auth_key_id + msg_key + aes.ige256_encrypt(data + padding, aes_key, aes_iv)
+
+
+def feed_packets(monkeypatch, native, offsets):
+    """Deliver server packets with msg_id = now + offset through Session.handle_packet."""
+    from types import SimpleNamespace
+    from pyrogram.session import Session
+    from pyrogram.session.internals import MsgId
+
+    monkeypatch.setattr(aes, "NATIVE", native)
+
+    async def main():
+        client = SimpleNamespace(loop=asyncio.get_running_loop(), name="t")
+        auth_key = os.urandom(256)
+        session = Session(client, 2, auth_key, False, is_media=True)
+        base = MsgId() + 1  # server ids are odd
+
+        for offset in offsets:
+            await session.handle_packet(
+                server_packet(raw.types.Pong(msg_id=1, ping_id=0), auth_key, session.session_id, base + offset)
+            )
+
+        return session.stored_msg_ids, base
+
+    return run(main())
+
+
+def test_duplicate_msg_ids_are_dropped_and_ids_stay_sorted(monkeypatch):
+    for native in (False, True):  # executor path and inline path behave the same
+        stored, base = feed_packets(monkeypatch, native, [0, 0, 8, 4, 8, 4, 12])
+
+        assert stored == [base, base + 4, base + 8, base + 12], native
+
+
+def test_msg_id_older_than_everything_seen_is_rejected(monkeypatch):
+    stored, base = feed_packets(monkeypatch, True, [100, 4, 100])
+
+    assert stored == [base + 100]
+
+
+def test_only_file_parts_are_treated_as_big_payloads():
+    from pyrogram.session import Session
+
+    part = bytes(512 * 1024)
+    ping = raw.functions.Ping(ping_id=1)
+    save = raw.functions.upload.SaveBigFilePart(file_id=1, file_part=0, file_total_parts=1, bytes=part)
+
+    assert Session._payload_size(ping) == 0
+    assert Session._payload_size(save) == len(part)
+    assert Session._payload_size(raw.functions.InvokeWithoutUpdates(query=save)) == len(part)
+    assert not aes.is_inline(len(part)) and aes.is_inline(0) == aes.NATIVE
+
+
+def test_inline_crypto_is_never_used_without_a_native_backend(monkeypatch):
+    monkeypatch.setattr(aes, "NATIVE", False)
+    assert not aes.is_inline(16)
+
+    monkeypatch.setattr(aes, "NATIVE", True)
+    assert aes.is_inline(16) and not aes.is_inline(aes.INLINE_LIMIT + 1)
+
+    monkeypatch.setattr(aes, "INLINE_LIMIT", 0)  # PYROGRAM_CRYPTO_INLINE=0 switches it off
+    assert not aes.is_inline(0) and not aes.is_inline(16)
+
+
+def test_first_round_trip_carries_the_whole_burst(monkeypatch):
+    """A small file must not need a second round trip after the first answer."""
+    blob = os.urandom(2 * MB + 5)
+
+    def slow(session):
+        session.delay = 0.3
+
+    t = __import__("time").monotonic()
+    _, got = run_download(monkeypatch, blob, configure=slow)
+    elapsed = __import__("time").monotonic() - t
+
+    assert got == blob
+    assert elapsed < 0.55  # one 0.3 s round trip, not two
+
+
+def test_speculative_requests_are_dropped_on_file_migrate(monkeypatch):
+    blob = os.urandom(3 * MB)
+
+    def wrong_dc(session):
+        session.migrate_to = 4 if session.dc_id == 2 else None
+
+    _, got = run_download(monkeypatch, blob, configure=wrong_dc)
+
+    assert got == blob
+    assert {s.dc_id for s in FakeSession.registry} == {2, 4}
+
+
+def test_upload_parts_survive_short_reads_and_keep_their_boundaries(monkeypatch, tmp_path):
+    """A raw stream may return fewer bytes than asked; part boundaries must not shift."""
+    data = os.urandom(5 * 512 * 1024 + 1234)
+    path = tmp_path / "f.bin"
+    path.write_bytes(data)
+
+    class Trickle(io.RawIOBase):
+        """Raw stream that never returns more than 100 kB per read, like a socket or a pipe."""
+        name = "f.bin"
+
+        def __init__(self, payload):
+            self._b, self._pos = payload, 0
+
+        def readable(self):
+            return True
+
+        def seekable(self):
+            return True
+
+        def tell(self):
+            return self._pos
+
+        def seek(self, offset, whence=0):
+            self._pos = offset if whence == 0 else len(self._b) + offset if whence == 2 else self._pos + offset
+            return self._pos
+
+        def read(self, n=-1):
+            n = 100_000 if n is None or n < 0 else min(n, 100_000)
+            out = self._b[self._pos:self._pos + n]
+            self._pos += len(out)
+            return out
+
+    sessions = [FakeSession() for _ in range(3)]
+
+    async def main():
+        client = make_client(monkeypatch)
+
+        async def get_sessions(count):
+            return sessions[:count]
+
+        client._get_upload_sessions = get_sessions
+
+        return await client.save_file(Trickle(data))
+
+    result = run(main())
+
+    uploaded = {}
+    for s in sessions:
+        uploaded.update(s.uploaded)
+
+    part = 512 * 1024
+    assert b"".join(uploaded[i] for i in sorted(uploaded)) == data
+    assert all(len(uploaded[i]) == part for i in sorted(uploaded)[:-1])
+    assert result.parts == 6
+
+
+def test_small_upload_md5_matches_and_uses_every_part(monkeypatch, tmp_path):
+    data = os.urandom(3 * 512 * 1024 + 7)  # under 10 MB: a regular InputFile with md5
+    path = tmp_path / "small.bin"
+    path.write_bytes(data)
+
+    sessions = [FakeSession() for _ in range(4)]
+    result = run_upload(monkeypatch, path, sessions)
+
+    assert isinstance(result, raw.types.InputFile)
+    assert result.md5_checksum == hashlib.md5(data).hexdigest()
+    assert result.parts == 4
+
+
+def test_upload_keeps_several_requests_in_flight_per_connection(monkeypatch, tmp_path):
+    path = tmp_path / "f.bin"
+    path.write_bytes(os.urandom(20 * MB))
+
+    peak = {"now": 0, "max": 0}
+    session = FakeSession()
+    session.delay = 0.02
+    original = session.invoke
+
+    async def counting(query, *a, **k):
+        peak["now"] += 1
+        peak["max"] = max(peak["max"], peak["now"])
+        try:
+            return await original(query, *a, **k)
+        finally:
+            peak["now"] -= 1
+
+    session.invoke = counting
+    run_upload(monkeypatch, path, [session])
+
+    assert peak["max"] >= 2  # UPLOAD_DEPTH requests overlapped on the single connection
