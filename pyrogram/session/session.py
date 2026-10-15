@@ -49,6 +49,9 @@ class Result:
 class Session:
     START_TIMEOUT = 1
     WAIT_TIMEOUT = 15
+    # Timeout for large media transfers (GetFile / SaveFilePart). With many 1 MB requests in
+    # flight on a slow or high-latency route, 15 s is too short and causes needless retries.
+    MEDIA_WAIT_TIMEOUT = int(os.environ.get("PYROGRAM_MEDIA_TIMEOUT", 60))
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 5
     ACKS_THRESHOLD = 8
@@ -177,7 +180,7 @@ class Session:
 
         self.ping_task_event.clear()
 
-        self.connection.close()
+        await self.connection.close()
 
         if self.network_task:
             await self.network_task
