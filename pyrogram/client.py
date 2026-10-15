@@ -1098,7 +1098,14 @@ class Client(Methods):
                 async for chunk in self.get_file(
                     file_id, file_size, 0, written // self.FILE_UNIT, progress, progress_args
                 ):
-                    file.write(chunk)
+                    if in_memory:
+                        file.write(chunk)
+                    else:
+                        # A 1 MiB write to a slow disk, SD card or network mount blocks for
+                        # milliseconds to seconds; on the event loop that freezes every
+                        # connection's reads and shows up as speed dips.
+                        await self.loop.run_in_executor(None, file.write, chunk)
+
                     written += len(chunk)
 
                 if not size_is_exact or written == file_size:
@@ -1556,9 +1563,24 @@ class Client(Methods):
             total = abs(limit) * per_unit or ((1 << 31) - 1)
             offset_bytes = abs(offset) * self.FILE_UNIT
             dc_id = file_id.dc_id
-            is_coro_progress = (
-                inspect.iscoroutinefunction(progress) if progress else False
+            # Bytes that have *arrived* (chunks complete out of order, they are handed over in
+            # order). Progress follows arrival, which is smooth, instead of the in-order hand-over,
+            # which comes in bursts whenever one slow request releases a queue of finished ones.
+            received = [offset_bytes]
+            reporter = (
+                _ProgressReporter(
+                    self, progress, progress_args, file_size,
+                    lambda: max(received[0], offset_bytes),
+                )
+                if progress
+                else None
             )
+
+            def count(task):
+                if not task.cancelled() and task.exception() is None:
+                    received[0] += len(getattr(task.result(), "bytes", b""))
+
+            reporter_done = False
 
             try:
                 # First chunk: it also reveals whether the file is CDN-served and, through
@@ -1588,6 +1610,16 @@ class Client(Methods):
                         first = self.loop.create_task(
                             self._get_file_chunk(dc_id, location, offset_bytes, chunk_size)
                         )
+                        first.add_done_callback(count)
+
+                        # Open the extra connections now, not after the first answer: their
+                        # handshakes overlap that round trip, so the speed climbs to full in one
+                        # step instead of creeping up connection by connection.
+                        wanted = self._download_connections(file_size, chunk_size)
+
+                        if wanted > 1:
+                            await self._get_media_sessions(dc_id, wanted)
+
                         spec = [
                             (
                                 self.loop.create_task(
@@ -1600,6 +1632,9 @@ class Client(Methods):
                             )
                             for k in range(1, ahead + 1)
                         ]
+
+                        for t, _, _ in spec:
+                            t.add_done_callback(count)
 
                         try:
                             r = await first
@@ -1660,6 +1695,7 @@ class Client(Methods):
                                     dc_id, location, next_offset, chunk_size, scheduled
                                 )
                             )
+                            task.add_done_callback(count)
                             pending.append((task, next_offset, scheduled))
                             next_offset += chunk_size
                             scheduled += 1
@@ -1689,21 +1725,9 @@ class Client(Methods):
 
                             yield chunk
 
-                            if progress:
-                                func = functools.partial(
-                                    progress,
-                                    min(offset_bytes, file_size)
-                                    if file_size != 0
-                                    else offset_bytes,
-                                    file_size,
-                                    *progress_args,
-                                )
-                                if is_coro_progress:
-                                    await func()
-                                else:
-                                    await self.loop.run_in_executor(
-                                        self.executor, func
-                                    )
+                            if reporter:
+                                reporter.check()
+                                reporter.poke()
 
                             if is_last:
                                 break
@@ -1803,21 +1827,9 @@ class Client(Methods):
                             current += 1
                             offset_bytes += chunk_len
 
-                            if progress:
-                                func = functools.partial(
-                                    progress,
-                                    min(offset_bytes, file_size)
-                                    if file_size != 0
-                                    else offset_bytes,
-                                    file_size,
-                                    *progress_args,
-                                )
-                                if is_coro_progress:
-                                    await func()
-                                else:
-                                    await self.loop.run_in_executor(
-                                        self.executor, func
-                                    )
+                            if reporter:
+                                reporter.check()
+                                reporter.poke()
 
                             if (
                                 chunk_len < chunk_size
@@ -1829,16 +1841,99 @@ class Client(Methods):
                                 break
                     finally:
                         await cdn_session.stop()
+
+                # Deliver the last progress value (and any error the callback raised) before
+                # the generator ends, as the inline callback used to.
+                if reporter:
+                    reporter_done = True
+                    await reporter.close()
             except pyrogram.StopTransmission:
                 raise
             except Exception as e:
                 log.exception(e)
+            finally:
+                if reporter and not reporter_done:
+                    reporter.abort()
 
     def guess_mime_type(self, filename: str) -> Optional[str]:
         return self.mimetypes.guess_type(filename)[0]
 
     def guess_extension(self, mime_type: str) -> Optional[str]:
         return self.mimetypes.guess_extension(mime_type)
+
+
+class _ProgressReporter:
+    """Delivers progress callbacks beside the download pipeline instead of inside it.
+
+    The pipeline used to `await` the user's callback after every chunk. A callback that edits a
+    Telegram message (50 ms to several seconds, plus flood waits) then froze the whole pipeline:
+    no new requests were sent while it ran, so the speed fell to one chunk per callback (3 MB/s)
+    and jumped up again in bursts. Now:
+
+    - the callback runs in its own task, never more than one call at a time;
+    - it is fed the *current* byte count whenever it is ready, so a slow callback skips values
+      instead of queueing them (the last value is always delivered);
+    - an exception raised by the callback (e.g. stop_transmission()) is re-raised in the
+      transfer by check(), so cancelling still works.
+    """
+
+    def __init__(self, client, progress, progress_args, file_size, sample):
+        self.client = client
+        self.progress = progress
+        self.args = progress_args
+        self.file_size = file_size
+        self.sample = sample
+        self.is_coro = inspect.iscoroutinefunction(progress)
+        self.error = None
+        self._closing = False
+        self._wake = asyncio.Event()
+        self._task = client.loop.create_task(self._run())
+
+    def poke(self):
+        self._wake.set()
+
+    def check(self):
+        if self.error is not None:
+            raise self.error
+
+    async def _call(self):
+        value = self.sample()
+
+        if self.file_size:
+            value = min(value, self.file_size)
+
+        func = functools.partial(self.progress, value, self.file_size, *self.args)
+
+        if self.is_coro:
+            await func()
+        else:
+            await self.client.loop.run_in_executor(self.client.executor, func)
+
+    async def _run(self):
+        try:
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+                await self._call()
+
+                if self._closing and not self._wake.is_set():
+                    return
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            self.error = e
+
+    async def close(self):
+        """Deliver the final value, then stop. Raises what the callback raised, if anything."""
+        self._closing = True
+        self._wake.set()
+        await asyncio.shield(self._task)
+        self.check()
+
+    def abort(self):
+        if not self._task.done():
+            self._task.cancel()
+            self._task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
 
 class Cache:
