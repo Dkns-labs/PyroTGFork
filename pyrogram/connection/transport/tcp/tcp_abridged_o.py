@@ -16,6 +16,7 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -35,6 +36,10 @@ class TCPAbridgedO(TCP):
 
         self.encrypt = None
         self.decrypt = None
+
+        # The CTR keystream is stateful: frames must be encrypted and written in the same order.
+        # crypto_executor has several workers, so this lock (not the executor) provides that order.
+        self._send_order = asyncio.Lock()
 
     async def connect(self, address: tuple):
         await super().connect(address)
@@ -58,9 +63,13 @@ class TCPAbridgedO(TCP):
     async def send(self, data: bytes, *args):
         length = len(data) // 4
         data = (bytes([length]) if length <= 126 else b"\x7f" + length.to_bytes(3, "little")) + data
-        payload = await self.loop.run_in_executor(pyrogram.crypto_executor, aes.ctr256_encrypt, data, *self.encrypt)
 
-        await super().send(payload)
+        async with self._send_order:
+            payload = await self.loop.run_in_executor(
+                pyrogram.crypto_executor, aes.ctr256_encrypt, data, *self.encrypt
+            )
+
+            await super().send(payload)
 
     async def recv(self, length: int = 0) -> Optional[bytes]:
         length = await super().recv(1)
