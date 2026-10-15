@@ -1074,3 +1074,193 @@ def test_upload_keeps_several_requests_in_flight_per_connection(monkeypatch, tmp
     run_upload(monkeypatch, path, [session])
 
     assert peak["max"] >= 2  # UPLOAD_DEPTH requests overlapped on the single connection
+
+
+# ---------------------------------------------------------------------------------------------
+# Stable speed: progress callbacks, disk writes and ramp-up must not throttle the pipeline
+# ---------------------------------------------------------------------------------------------
+
+def _fast_client(monkeypatch, blob, delay=0.01):
+    original_init = FakeSession.__init__
+
+    def init(self, *a, **k):
+        original_init(self, *a, **k)
+        self.blobs = {2: blob}
+        self.delay = delay
+
+    monkeypatch.setattr(FakeSession, "__init__", init)
+    client = make_client(monkeypatch)
+
+    async def create(dc_id_):
+        return FakeSession(client, dc_id_)
+
+    client._create_media_session = create
+    return client
+
+
+def test_slow_progress_callback_does_not_throttle_the_download(monkeypatch):
+    import time
+
+    blob = os.urandom(30 * MB)
+    calls = []
+
+    async def main():
+        client = _fast_client(monkeypatch, blob)
+
+        async def progress(current, total):
+            calls.append(current)
+            await asyncio.sleep(0.3)  # e.g. editing a status message
+
+        t = time.monotonic()
+        n = 0
+        async for c in client.get_file(file_id(), len(blob), 0, 0, progress):
+            n += len(c)
+        elapsed = time.monotonic() - t
+        await client._cancel_background_work()
+        return n, elapsed
+
+    n, elapsed = run(main())
+
+    assert n == len(blob)
+    # 30 chunks x 0.3 s = 9 s if the callback sat inside the pipeline (the old behaviour)
+    assert elapsed < 3
+    assert calls[-1] == len(blob)            # the final value is always delivered
+    assert calls == sorted(calls)            # never goes backwards
+    assert len(calls) < 30                   # slow callbacks skip values instead of queueing them
+
+
+def test_progress_callbacks_never_overlap_and_end_at_the_full_size(monkeypatch):
+    blob = os.urandom(12 * MB + 1)
+    running = {"now": 0, "max": 0}
+    seen = []
+
+    async def main():
+        client = _fast_client(monkeypatch, blob)
+
+        async def progress(current, total):
+            running["now"] += 1
+            running["max"] = max(running["max"], running["now"])
+            await asyncio.sleep(0.02)
+            seen.append((current, total))
+            running["now"] -= 1
+
+        async for _ in client.get_file(file_id(), len(blob), 0, 0, progress):
+            pass
+
+        await client._cancel_background_work()
+
+    run(main())
+
+    assert running["max"] == 1
+    assert seen[-1] == (len(blob), len(blob))
+
+
+def test_sync_progress_callbacks_still_work(monkeypatch):
+    blob = os.urandom(5 * MB)
+    seen = []
+
+    async def main():
+        client = _fast_client(monkeypatch, blob)
+        client.executor = ThreadPoolExecutor(2)
+
+        def progress(current, total, tag):
+            seen.append((current, total, tag))
+
+        async for _ in client.get_file(file_id(), len(blob), 0, 0, progress, ("x",)):
+            pass
+
+        await client._cancel_background_work()
+
+    run(main())
+
+    assert seen and seen[-1] == (len(blob), len(blob), "x")
+
+
+def test_stop_transmission_from_a_progress_callback_still_stops_the_download(monkeypatch):
+    blob = os.urandom(40 * MB)
+    got = []
+
+    async def main():
+        client = _fast_client(monkeypatch, blob, delay=0.02)
+
+        async def progress(current, total):
+            if current >= 3 * MB:
+                raise pyrogram.StopTransmission
+
+        try:
+            async for c in client.get_file(file_id(), len(blob), 0, 0, progress):
+                got.append(len(c))
+        finally:
+            await client._cancel_background_work()
+
+    with pytest.raises(pyrogram.StopTransmission):
+        run(main())
+
+    # Progress counts bytes that have arrived (ahead of what was handed over), so the stop lands
+    # a little before 3 MB delivered; the point is that it stops long before the end.
+    assert 0 < sum(got) < len(blob) // 4
+
+
+def test_extra_connections_start_with_the_first_request_not_after_it(monkeypatch):
+    blob = os.urandom(30 * MB)
+    events = []
+
+    async def main():
+        client = _fast_client(monkeypatch, blob, delay=0.2)
+        grow = client._get_media_sessions
+
+        async def spy_grow(dc_id, count):
+            events.append("pool")
+            return await grow(dc_id, count)
+
+        client._get_media_sessions = spy_grow
+        original = FakeSession.invoke
+
+        async def spy_invoke(self, query, *a, **k):
+            result = await original(self, query, *a, **k)
+            events.append("answer")
+            return result
+
+        monkeypatch.setattr(FakeSession, "invoke", spy_invoke)
+
+        async for _ in client.get_file(file_id(), len(blob)):
+            pass
+
+        await client._cancel_background_work()
+
+    run(main())
+
+    assert events[0] == "pool"  # asked for before any GetFile answered
+
+
+def test_disk_download_is_written_off_the_event_loop_and_intact(monkeypatch, tmp_path):
+    blob = os.urandom(9 * MB + 31)
+    threads = set()
+
+    async def main():
+        client = _fast_client(monkeypatch, blob)
+        loop_thread = __import__("threading").get_ident()
+
+        class Spy(io.FileIO):
+            def write(self, b):
+                threads.add(__import__("threading").get_ident() != loop_thread)
+                return super().write(b)
+
+        real_open = open
+
+        def spy_open(path, mode="r", buffering=-1, *a, **k):
+            return Spy(path, "wb") if str(path).endswith(".temp") else real_open(path, mode, buffering, *a, **k)
+
+        monkeypatch.setattr(__import__("builtins"), "open", spy_open)
+
+        try:
+            return await client.handle_download((file_id(), str(tmp_path), "f.bin", False, len(blob), None, ()))
+        finally:
+            monkeypatch.setattr(__import__("builtins"), "open", real_open)
+            await client._cancel_background_work()
+
+    path = run(main())
+
+    with open(path, "rb") as f:
+        assert f.read() == blob
+    assert threads == {True}  # every write happened on a worker thread
