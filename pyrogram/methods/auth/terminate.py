@@ -47,10 +47,18 @@ class Terminate:
         await self.storage.save()
         await self.dispatcher.stop()
 
-        for media_session in self.media_sessions.values():
+        primary = list(self.media_sessions.values())
+
+        for media_session in primary:
             await media_session.stop()
 
+        for pool in self.media_session_pool.values():
+            for media_session in pool:
+                if media_session not in primary:
+                    await media_session.stop()
+
         self.media_sessions.clear()
+        self.media_session_pool.clear()
 
         self.updates_watchdog_event.set()
 
