@@ -46,29 +46,33 @@ class SaveFile:
             auth_key = await self.storage.auth_key()
             test_mode = await self.storage.test_mode()
 
-            # Remove any dead/disconnected sessions from the pool
-            valid_sessions = []
-            for s in self._upload_session_pool:
-                if getattr(s, "is_started", None) or getattr(s, "is_connected", True):
-                    valid_sessions.append(s)
-                else:
-                    try:
-                        await s.stop()
-                    except Exception:
-                        pass
-            self._upload_session_pool = valid_sessions
+            # Only hand out sessions that are connected right now. (`is_connected` is an
+            # asyncio.Event, so it must be checked with is_set(), never by truthiness.)
+            # A reconnecting session heals itself and is reused once it is back.
+            usable = [s for s in self._upload_session_pool if s.is_connected.is_set()]
 
-            # Spawn missing sessions in parallel if pool is smaller than needed
-            missing = count - len(self._upload_session_pool)
+            # Spawn missing sessions in parallel; one failing to start must not lose the rest
+            missing = count - len(usable)
             if missing > 0:
                 new_sessions = [
                     Session(self, dc_id, auth_key, test_mode, is_media=True)
                     for _ in range(missing)
                 ]
-                await asyncio.gather(*(s.start() for s in new_sessions))
-                self._upload_session_pool.extend(new_sessions)
+                results = await asyncio.gather(
+                    *(s.start() for s in new_sessions), return_exceptions=True
+                )
 
-            return self._upload_session_pool[:count]
+                for s, res in zip(new_sessions, results):
+                    if isinstance(res, BaseException):
+                        log.warning("Upload session failed to start: %r", res)
+                    else:
+                        self._upload_session_pool.append(s)
+                        usable.append(s)
+
+            if not usable:
+                raise ConnectionError("No upload session could be started")
+
+            return usable[:count]
 
     async def save_file(
         self: "pyrogram.Client",
