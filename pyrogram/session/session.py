@@ -108,6 +108,10 @@ class Session:
 
         self.is_connected = asyncio.Event()
 
+        # Set when a background reconnect gave up (e.g. AuthKeyDuplicated). Pools use it to
+        # drop the session and build a fresh one instead of reusing a dead connection forever.
+        self.failure = None
+
 
     async def start(self):
         while True:
@@ -166,6 +170,7 @@ class Session:
             else:
                 break
 
+        self.failure = None
         self.is_connected.set()
 
         log.info("Session started")
@@ -199,6 +204,17 @@ class Session:
     async def restart(self):
         await self.stop()
         await self.start()
+
+    async def _background_restart(self):
+        # Runs as a detached task: an exception here used to vanish and leave the session
+        # disconnected forever without anything noticing.
+        try:
+            await self.restart()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.failure = e
+            log.error("Session restart failed, marking session as dead: %r", e)
 
     async def handle_packet(self, packet):
         try:
@@ -327,7 +343,7 @@ class Session:
                     log.warning(f'Server sent "{Int.read(BytesIO(packet))}"')
 
                 if self.is_connected.is_set():
-                    self.client.loop.create_task(self.restart())
+                    self.client.loop.create_task(self._background_restart())
 
                 break
 
