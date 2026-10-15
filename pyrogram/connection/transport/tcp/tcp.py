@@ -19,6 +19,7 @@
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
 from typing import Optional, Tuple
 
@@ -29,7 +30,15 @@ log = logging.getLogger(__name__)
 
 class TCP:
     TIMEOUT = 10
-    SOCKET_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB TCP send/recv window for high-speed throughput
+    # User-space (asyncio) read/write buffer limits only; this does NOT touch the kernel TCP window.
+    SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
+
+    # Kernel socket buffer (SO_RCVBUF/SO_SNDBUF). Default 0 = leave it alone so Linux keeps TCP
+    # auto-tuning. Forcing a fixed size turns auto-tuning OFF and clamps the window to
+    # net.core.rmem_max/wmem_max (often only ~208 KB), which caps each connection at roughly
+    # window / RTT -- a few MB/s on a long route such as India <-> Telegram DCs.
+    # Opt in only if you know your sysctl limits: PYROGRAM_SOCKET_BUFFER=<bytes>
+    KERNEL_SOCKET_BUFFER = int(os.environ.get("PYROGRAM_SOCKET_BUFFER", 0))
 
     def __init__(self, ipv6: bool, proxy: dict):
         self.socket = None
@@ -57,11 +66,12 @@ class TCP:
         except (OSError, AttributeError):
             pass
 
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP.SOCKET_BUFFER_SIZE)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP.SOCKET_BUFFER_SIZE)
-        except (OSError, AttributeError):
-            pass
+        if TCP.KERNEL_SOCKET_BUFFER > 0:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP.KERNEL_SOCKET_BUFFER)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP.KERNEL_SOCKET_BUFFER)
+            except (OSError, AttributeError):
+                pass
 
     async def _connect(self, address: Tuple[str, int]):
         if self.proxy:
