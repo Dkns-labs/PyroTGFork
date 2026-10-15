@@ -1057,12 +1057,36 @@ class Client(Methods):
             else open(temp_file_path, "wb", buffering=self.DISK_BUFFER_SIZE)
         )
 
+        # Types whose reported file_size is exact, so a short download means a failed one
+        exact_size_types = (
+            FileType.VOICE, FileType.VIDEO, FileType.DOCUMENT, FileType.STICKER,
+            FileType.AUDIO, FileType.ANIMATION, FileType.VIDEO_NOTE,
+            FileType.DOCUMENT_AS_FILE,
+        )
+
         try:
+            written = 0
+
             async for chunk in self.get_file(
                 file_id, file_size, 0, 0, progress, progress_args
             ):
                 file.write(chunk)
+                written += len(chunk)
+
+            # get_file logs and swallows transfer errors, which would otherwise leave a
+            # truncated file that looks complete. Treat a short download as a failure.
+            if (
+                file_size
+                and file_id.file_type in exact_size_types
+                and written != file_size
+            ):
+                raise OSError(
+                    f"Incomplete download: received {written} of {file_size} bytes"
+                )
         except BaseException as e:
+            if not isinstance(e, asyncio.CancelledError):
+                log.error("Download failed: %r", e)
+
             if not in_memory:
                 file.close()
                 try:
