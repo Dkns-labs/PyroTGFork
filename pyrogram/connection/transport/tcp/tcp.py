@@ -40,6 +40,10 @@ class TCP:
     # Opt in only if you know your sysctl limits: PYROGRAM_SOCKET_BUFFER=<bytes>
     KERNEL_SOCKET_BUFFER = int(os.environ.get("PYROGRAM_SOCKET_BUFFER", 0))
 
+    # How long sent data may stay unacknowledged before the kernel drops the connection
+    # (TCP_USER_TIMEOUT, Linux). 0 leaves the system default. PYROGRAM_TCP_USER_TIMEOUT=<ms>
+    USER_TIMEOUT_MS = int(os.environ.get("PYROGRAM_TCP_USER_TIMEOUT", 30000))
+
     def __init__(self, ipv6: bool, proxy: dict):
         self.socket = None
 
@@ -65,6 +69,27 @@ class TCP:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         except (OSError, AttributeError):
             pass
+
+        # SO_KEEPALIVE alone only starts probing after ~2 hours (Linux default), so a NAT or
+        # mobile network that silently drops a connection left uploads hanging for minutes.
+        # Probe after 15 s idle, every 5 s, give up after 3 misses; and abort a connection whose
+        # sent data stays unacknowledged for 30 s (Linux only). Each option is optional: names
+        # that the platform lacks are skipped.
+        for name, value in (
+            ("TCP_KEEPIDLE", 15),
+            ("TCP_KEEPINTVL", 5),
+            ("TCP_KEEPCNT", 3),
+            ("TCP_USER_TIMEOUT", TCP.USER_TIMEOUT_MS),
+        ):
+            option = getattr(socket, name, None)
+
+            if option is None or (name == "TCP_USER_TIMEOUT" and value <= 0):
+                continue
+
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+            except (OSError, AttributeError):
+                pass
 
         if TCP.KERNEL_SOCKET_BUFFER > 0:
             try:
