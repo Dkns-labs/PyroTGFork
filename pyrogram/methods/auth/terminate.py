@@ -47,6 +47,8 @@ class Terminate:
         await self.storage.save()
         await self.dispatcher.stop()
 
+        await self._cancel_background_work()
+
         primary = list(self.media_sessions.values())
 
         for media_session in primary:
