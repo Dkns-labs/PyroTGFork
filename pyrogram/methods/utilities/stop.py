@@ -72,10 +72,15 @@ class Stop:
         if hasattr(self, "_upload_session_pool") and self._upload_session_pool:
             close_tasks.extend(s.stop() for s in self._upload_session_pool)
 
+        primary = list(self.media_sessions.values())
+        for pool in self.media_session_pool.values():
+            close_tasks.extend(s.stop() for s in pool if s not in primary)
+
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
         self.media_sessions.clear()
+        self.media_session_pool.clear()
         if hasattr(self, "_upload_session_pool"):
             self._upload_session_pool.clear()
 
