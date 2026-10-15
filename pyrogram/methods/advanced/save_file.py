@@ -29,9 +29,13 @@ from typing import BinaryIO, Callable, Optional, Union
 
 import pyrogram
 from pyrogram import StopTransmission, raw
+from pyrogram.errors import InternalServerError, ServiceUnavailable
 from pyrogram.session import Session
 
 log = logging.getLogger(__name__)
+
+# Attempts per upload part; retries are sent over a different connection when possible
+PART_RETRIES = max(1, int(os.environ.get("PYROGRAM_PART_RETRIES", 4)))
 
 
 class SaveFile:
@@ -49,6 +53,11 @@ class SaveFile:
             # Only hand out sessions that are connected right now. (`is_connected` is an
             # asyncio.Event, so it must be checked with is_set(), never by truthiness.)
             # A reconnecting session heals itself and is reused once it is back.
+            for dead in [s for s in self._upload_session_pool if s.failure is not None]:
+                log.warning("Dropping dead upload session: %r", dead.failure)
+                self._upload_session_pool.remove(dead)
+                self._spawn(self._quiet_stop(dead))
+
             usable = [s for s in self._upload_session_pool if s.is_connected.is_set()]
 
             # Spawn missing sessions in parallel; one failing to start must not lose the rest
@@ -94,7 +103,29 @@ class SaveFile:
             if path is None:
                 return None
 
-            async def worker(session: Session):
+            async def send_part(session: Session, part_index: int, chunk: bytes):
+                if is_big:
+                    rpc = raw.functions.upload.SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=part_index,
+                        file_total_parts=file_total_parts,
+                        bytes=chunk,
+                    )
+                else:
+                    rpc = raw.functions.upload.SaveFilePart(
+                        file_id=file_id,
+                        file_part=part_index,
+                        bytes=chunk,
+                    )
+
+                await session.invoke(
+                    rpc,
+                    retries=2,
+                    timeout=Session.MEDIA_WAIT_TIMEOUT,
+                    sleep_threshold=self.sleep_threshold,
+                )
+
+            async def worker(session: Session, position: int):
                 while True:
                     data = await queue.get()
 
@@ -102,31 +133,39 @@ class SaveFile:
                         queue.task_done()
                         return
 
-                    try:
-                        part_index, chunk = data
-                        if is_big:
-                            rpc = raw.functions.upload.SaveBigFilePart(
-                                file_id=file_id,
-                                file_part=part_index,
-                                file_total_parts=file_total_parts,
-                                bytes=chunk,
-                            )
-                        else:
-                            rpc = raw.functions.upload.SaveFilePart(
-                                file_id=file_id,
-                                file_part=part_index,
-                                bytes=chunk,
-                            )
+                    part_index, chunk = data
 
-                        await session.invoke(
-                            rpc,
-                            timeout=Session.MEDIA_WAIT_TIMEOUT,
-                            sleep_threshold=self.sleep_threshold,
-                        )
-                    except Exception as e:
-                        # Remember the failure: a lost part must fail the upload, not be skipped silently
-                        log.error("Upload of part %s failed: %r", data[0], e)
-                        errors.append(e)
+                    try:
+                        # The upload is already lost: don't spend bandwidth on the remaining parts
+                        if errors:
+                            continue
+
+                        last_error = None
+
+                        for attempt in range(PART_RETRIES):
+                            # First try on our own connection, retries move to another one
+                            candidates = [s for s in sessions if s.failure is None] or [session]
+                            target = session if attempt == 0 and session.failure is None else \
+                                candidates[(position + attempt) % len(candidates)]
+
+                            try:
+                                await send_part(target, part_index, chunk)
+                                last_error = None
+                                break
+                            except (OSError, TimeoutError, asyncio.TimeoutError, InternalServerError,
+                                    ServiceUnavailable) as e:
+                                last_error = e
+                                log.warning("Upload of part %s failed (attempt %s/%s): %r",
+                                            part_index, attempt + 1, PART_RETRIES, e)
+                                await asyncio.sleep(min(0.25 * 2 ** attempt, 2.0))
+                            except Exception as e:
+                                last_error = e
+                                break
+
+                        if last_error is not None:
+                            # Remember the failure: a lost part must fail the upload, not be skipped silently
+                            log.error("Upload of part %s failed: %r", part_index, last_error)
+                            errors.append(last_error)
                     finally:
                         queue.task_done()
 
@@ -185,7 +224,7 @@ class SaveFile:
             # Bounded queue prevents loading large files entirely into RAM
             queue: asyncio.Queue = asyncio.Queue(maxsize=workers_count * 2)
             errors: list = []
-            workers =[self.loop.create_task(worker(s)) for s in sessions]
+            workers = [self.loop.create_task(worker(s, i)) for i, s in enumerate(sessions)]
 
             is_coro_progress = inspect.iscoroutinefunction(progress) if progress else False
 
