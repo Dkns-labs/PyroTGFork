@@ -67,6 +67,8 @@ class Stop:
                 raw.functions.account.FinishTakeoutSession()
             )
 
+        await self._cancel_background_work()
+
         # Concurrently close all cached download sessions and pooled upload sessions
         close_tasks = [i.stop() for i in self.media_sessions.values()]
         if hasattr(self, "_upload_session_pool") and self._upload_session_pool:
