@@ -40,4 +40,22 @@ from . import raw, types, filters, handlers, emoji, enums
 from .client import Client
 from .sync import idle, compose
 
-crypto_executor = ThreadPoolExecutor(1, thread_name_prefix="CryptoWorker")
+def _crypto_threads() -> int:
+    # MTProto crypto (IGE/CTR/SHA-256) is CPU bound and releases the GIL, but a single worker
+    # serializes every connection's traffic and caps total throughput at one core. Several
+    # workers are safe because per-connection cipher state is ordered by the transport itself
+    # (see TCPAbridgedO). Override with PYROGRAM_CRYPTO_THREADS=<n> (1 restores the old behaviour).
+    import os
+
+    try:
+        forced = int(os.environ.get("PYROGRAM_CRYPTO_THREADS", 0))
+    except ValueError:
+        forced = 0
+
+    if forced > 0:
+        return min(forced, 32)
+
+    return max(1, min(4, os.cpu_count() or 1))
+
+
+crypto_executor = ThreadPoolExecutor(_crypto_threads(), thread_name_prefix="CryptoWorker")

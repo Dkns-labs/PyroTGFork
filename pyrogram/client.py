@@ -49,8 +49,11 @@ from pyrogram.errors import (
     ChannelPrivate,
     FloodPremiumWait,
     FloodWait,
+    InternalServerError,
     PersistentTimestampInvalid,
     PersistentTimestampOutdated,
+    SeeOther,
+    ServiceUnavailable,
     SessionPasswordNeeded,
     VolumeLocNotFound,
 )
@@ -217,6 +220,9 @@ class Client(Methods):
         self.media_sessions = {}
         self.media_session_pool = {}  # dc_id -> [Session, ...] extra parallel download connections
         self.media_sessions_lock = asyncio.Lock()
+        self._dc_locks = {}  # dc_id -> asyncio.Lock, serializes media session creation per DC
+        self._media_growth_tasks = {}  # dc_id -> background task growing the download pool
+        self._bg_tasks = set()
 
         self.save_file_semaphore = asyncio.Semaphore(
             self.max_concurrent_transmissions
@@ -1109,86 +1115,268 @@ class Client(Methods):
                 shutil.move(temp_file_path, final_file_path)
                 return final_file_path
 
+    # ---------------------------------------------------------------------------------------
+    # Media session pool / DC routing
+    # ---------------------------------------------------------------------------------------
+
+    # Attempts per file chunk; every retry goes to a different connection when one is available.
+    CHUNK_RETRIES = max(1, int(os.environ.get("PYROGRAM_CHUNK_RETRIES", 4)))
+
+    # RPC errors that will not get better by asking again.
+    _FATAL_CHUNK_ERRORS = ("VOLUME_LOC_NOT_FOUND",)
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task() that keeps a strong reference until the task is done."""
+        task = self.loop.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _dc_lock(self, dc_id: int) -> asyncio.Lock:
+        lock = self._dc_locks.get(dc_id)
+
+        if lock is None:
+            lock = self._dc_locks[dc_id] = asyncio.Lock()
+
+        return lock
+
+    @staticmethod
+    async def _quiet_stop(session: Session):
+        try:
+            await session.stop()
+        except Exception as e:
+            log.debug("Ignored error while stopping a media session: %r", e)
+
+    def _evict_media_session(self, dc_id: int, session: Session):
+        """Forget a dead media session and close it in the background."""
+        if self.media_sessions.get(dc_id) is session:
+            del self.media_sessions[dc_id]
+
+        pool = self.media_session_pool.get(dc_id)
+
+        if pool and session in pool:
+            pool.remove(session)
+
+        log.warning("Dropping dead media session for DC%s: %r", dc_id, session.failure)
+        self._spawn(self._quiet_stop(session))
+
+    async def _create_media_session(self, dc_id: int) -> Session:
+        storage_dc_id = await self.storage.dc_id()
+        test_mode = await self.storage.test_mode()
+
+        auth_key = (
+            await Auth(self, dc_id, test_mode).create()
+            if dc_id != storage_dc_id
+            else await self.storage.auth_key()
+        )
+
+        session = Session(self, dc_id, auth_key, test_mode, is_media=True)
+        await session.start()
+
+        if dc_id != storage_dc_id:
+            for _ in range(3):
+                exported_auth = await self.invoke(
+                    raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+                )
+                try:
+                    await session.invoke(
+                        raw.functions.auth.ImportAuthorization(
+                            id=exported_auth.id,
+                            bytes=exported_auth.bytes,
+                        )
+                    )
+                except AuthBytesInvalid:
+                    continue
+                else:
+                    break
+            else:
+                await session.stop()
+                raise AuthBytesInvalid
+
+        return session
+
     async def _get_media_session(self, dc_id: int) -> Session:
-        """Thread-safe media session pooler with automatic cross-DC auth export."""
+        """Cached media session for a DC, with cross-DC auth export.
+
+        A cached session whose background reconnect gave up is replaced instead of being
+        handed out again. Creation is serialized per DC, so a slow first connection to one DC
+        does not hold up transfers on another.
+        """
         session = self.media_sessions.get(dc_id)
-        if session:
+
+        if session is not None and session.failure is None:
             return session
 
-        async with self.media_sessions_lock:
+        async with self._dc_lock(dc_id):
             session = self.media_sessions.get(dc_id)
-            if session:
+
+            if session is not None and session.failure is None:
                 return session
 
-            storage_dc_id = await self.storage.dc_id()
-            test_mode = await self.storage.test_mode()
+            if session is not None:
+                self._evict_media_session(dc_id, session)
 
-            auth_key = (
-                await Auth(self, dc_id, test_mode).create()
-                if dc_id != storage_dc_id
-                else await self.storage.auth_key()
-            )
+            session = await self._create_media_session(dc_id)
 
-            session = Session(
-                self, dc_id, auth_key, test_mode, is_media=True
-            )
-            await session.start()
+            async with self.media_sessions_lock:
+                current = self.media_sessions.get(dc_id)
 
-            if dc_id != storage_dc_id:
-                for _ in range(3):
-                    exported_auth = await self.invoke(
-                        raw.functions.auth.ExportAuthorization(dc_id=dc_id)
-                    )
-                    try:
-                        await session.invoke(
-                            raw.functions.auth.ImportAuthorization(
-                                id=exported_auth.id,
-                                bytes=exported_auth.bytes,
-                            )
-                        )
-                    except AuthBytesInvalid:
-                        continue
-                    else:
-                        break
+                if current is not None and current is not session and current.failure is None:
+                    # Another code path (e.g. inline sessions) registered one while we connected
+                    keep = current
                 else:
-                    await session.stop()
-                    raise AuthBytesInvalid
+                    self.media_sessions[dc_id] = session
+                    keep = session
 
-            self.media_sessions[dc_id] = session
-            return session
+            if keep is not session:
+                await self._quiet_stop(session)
+
+            return keep
 
     async def _get_media_sessions(self, dc_id: int, count: int) -> list:
-        """Return up to `count` warm media sessions for a DC (the first is the regular cached one).
+        """Return the warm media sessions of a DC, growing the pool towards `count` in the background.
 
-        Extra sessions reuse the same auth key, so no new authorization export/import is needed.
+        The first session is the regular cached one, so this never delays the transfer waiting for
+        extra connections: they join the pipeline as soon as they are up. Extra sessions reuse the
+        same auth key, so no new authorization export/import is needed.
         """
         first = await self._get_media_session(dc_id)
 
-        async with self.media_sessions_lock:
-            pool = self.media_session_pool.get(dc_id)
+        pool = self.media_session_pool.setdefault(dc_id, [])
 
-            if not pool or pool[0] is not first:
-                pool = self.media_session_pool[dc_id] = [first]
+        for s in list(pool):
+            if s.failure is not None:
+                self._evict_media_session(dc_id, s)
 
-            missing = count - len(pool)
+        if first not in pool:
+            pool.insert(0, first)
 
-            if missing > 0:
+        if len(pool) < count:
+            task = self._media_growth_tasks.get(dc_id)
+
+            if task is None or task.done():
+                self._media_growth_tasks[dc_id] = self._spawn(self._grow_media_pool(dc_id, count))
+
+        return list(pool)
+
+    async def _grow_media_pool(self, dc_id: int, count: int):
+        batch = []
+
+        try:
+            for _ in range(2):  # one retry round if some extra connections fail to start
+                first = self.media_sessions.get(dc_id)
+                pool = self.media_session_pool.get(dc_id)
+
+                if first is None or pool is None:
+                    return
+
+                missing = count - sum(1 for s in pool if s.failure is None)
+
+                if missing <= 0:
+                    return
+
                 test_mode = await self.storage.test_mode()
-                new_sessions = [
-                    Session(self, dc_id, first.auth_key, test_mode, is_media=True)
-                    for _ in range(missing)
-                ]
-                results = await asyncio.gather(
-                    *(s.start() for s in new_sessions), return_exceptions=True
+                batch = [Session(self, dc_id, first.auth_key, test_mode, is_media=True) for _ in range(missing)]
+                results = await asyncio.gather(*(s.start() for s in batch), return_exceptions=True)
+                started = 0
+
+                for s, res in zip(batch, results):
+                    if isinstance(res, BaseException):
+                        log.warning("Extra media session for DC%s failed to start: %r", dc_id, res)
+                    elif self.media_session_pool.get(dc_id) is pool:
+                        pool.append(s)
+                        started += 1
+                    else:
+                        await self._quiet_stop(s)  # client was stopped meanwhile
+
+                batch = []
+
+                if not started:
+                    return
+        except asyncio.CancelledError:
+            await asyncio.gather(*(self._quiet_stop(s) for s in batch))
+            raise
+        except Exception as e:
+            log.warning("Growing the media session pool for DC%s failed: %r", dc_id, e)
+
+    async def _cancel_background_work(self):
+        """Stop pool growth before sessions are torn down (used by stop/terminate)."""
+        tasks = [t for t in self._media_growth_tasks.values() if not t.done()]
+
+        for t in tasks:
+            t.cancel()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._media_growth_tasks.clear()
+
+    async def _pick_media_session(self, dc_id: int, idx: int, attempt: int) -> Session:
+        """Round-robin over healthy sessions; a retry lands on a different connection."""
+        for s in list(self.media_session_pool.get(dc_id, ())):
+            if s.failure is not None:
+                self._evict_media_session(dc_id, s)
+
+        pool = self.media_session_pool.get(dc_id)
+
+        if pool:
+            n = len(pool)
+
+            for k in range(n):
+                s = pool[(idx + attempt + k) % n]
+
+                if s.is_connected.is_set():
+                    return s
+
+            return pool[(idx + attempt) % n]  # all reconnecting: invoke() waits for one
+
+        return await self._get_media_session(dc_id)
+
+    async def _get_file_chunk(self, dc_id: int, location, offset: int, limit: int, idx: int = 0):
+        """One upload.GetFile with connection-level retries.
+
+        Session.invoke() already retries on the same connection; this adds a second layer that
+        moves the request to another connection (and drops dead ones), so one bad socket can no
+        longer abort a multi-gigabyte download.
+        """
+        last_error = None
+
+        for attempt in range(self.CHUNK_RETRIES):
+            session = await self._pick_media_session(dc_id, idx, attempt)
+
+            try:
+                return await session.invoke(
+                    raw.functions.upload.GetFile(location=location, offset=offset, limit=limit),
+                    retries=2,
+                    timeout=Session.MEDIA_WAIT_TIMEOUT,
+                    sleep_threshold=self.sleep_threshold,
+                )
+            except (OSError, TimeoutError, asyncio.TimeoutError, InternalServerError, ServiceUnavailable) as e:
+                if getattr(e, "ID", None) in self._FATAL_CHUNK_ERRORS:
+                    raise
+
+                last_error = e
+
+                if session.failure is not None:
+                    self._evict_media_session(dc_id, session)
+
+                (log.warning if attempt else log.info)(
+                    "GetFile offset=%s failed on DC%s (attempt %s/%s): %r",
+                    offset, dc_id, attempt + 1, self.CHUNK_RETRIES, e,
                 )
 
-                for s, res in zip(new_sessions, results):
-                    if isinstance(res, BaseException):
-                        log.warning("Extra media session failed to start: %r", res)
-                    else:
-                        pool.append(s)
+                await asyncio.sleep(min(0.25 * 2 ** attempt, 2.0))
 
-            return pool[:count]
+        raise last_error
+
+    def _download_connections(self, file_size: int, chunk_size: int) -> int:
+        """Connections worth opening for a file: small files must not pay for six handshakes."""
+        if file_size <= 0:
+            return min(2, self.DOWNLOAD_CONNECTIONS)
+
+        parts = -(-file_size // chunk_size)
+
+        return max(1, min(self.DOWNLOAD_CONNECTIONS, -(-parts // self.DOWNLOAD_PIPELINE_DEPTH)))
 
     async def get_file(
         self,
@@ -1262,46 +1450,57 @@ class Client(Methods):
             )
 
             try:
-                session = await self._get_media_session(dc_id)
+                # First chunk: it also reveals whether the file is CDN-served and, through
+                # FILE_MIGRATE, which DC really holds it.
+                migrations = 0
 
-                r = await session.invoke(
-                    raw.functions.upload.GetFile(
-                        location=location,
-                        offset=offset_bytes,
-                        limit=chunk_size,
-                    ),
-                    timeout=Session.MEDIA_WAIT_TIMEOUT,
-                    sleep_threshold=self.sleep_threshold,
-                )
+                while True:
+                    try:
+                        session = await self._get_media_session(dc_id)
+                        r = await self._get_file_chunk(
+                            dc_id, location, offset_bytes, chunk_size
+                        )
+                        break
+                    except SeeOther as e:
+                        if e.ID != "FILE_MIGRATE_X" or migrations >= 2 or not e.value:
+                            raise
+
+                        migrations += 1
+                        log.info("File lives in DC%s, not DC%s: re-routing", e.value, dc_id)
+                        dc_id = int(e.value)
 
                 if isinstance(r, raw.types.upload.File):
-                    # Parallel pipeline: keep a window of GetFile requests in flight,
-                    # spread round-robin over several connections, yield strictly in order.
-                    sessions = await self._get_media_sessions(
-                        dc_id, self.DOWNLOAD_CONNECTIONS
+                    # Parallel pipeline: keep a window of GetFile requests in flight, spread
+                    # round-robin over the DC's connections, yield strictly in order. Extra
+                    # connections are opened in the background and join as soon as they are up.
+                    await self._get_media_sessions(
+                        dc_id, self._download_connections(file_size, chunk_size)
                     )
-                    window = len(sessions) * self.DOWNLOAD_PIPELINE_DEPTH
                     pending = deque()
                     next_offset = offset_bytes + chunk_size
                     scheduled = 1  # the first chunk was already fetched
 
+                    def window():
+                        live = sum(
+                            1
+                            for s in self.media_session_pool.get(dc_id, ())
+                            if s.failure is None
+                        )
+                        return max(1, live) * self.DOWNLOAD_PIPELINE_DEPTH
+
                     def top_up():
                         nonlocal next_offset, scheduled
 
+                        limit_ahead = window()
+
                         while (
-                            len(pending) < window
+                            len(pending) < limit_ahead
                             and scheduled < total
                             and (file_size == 0 or next_offset < file_size)
                         ):
                             task = self.loop.create_task(
-                                sessions[scheduled % len(sessions)].invoke(
-                                    raw.functions.upload.GetFile(
-                                        location=location,
-                                        offset=next_offset,
-                                        limit=chunk_size,
-                                    ),
-                                    timeout=Session.MEDIA_WAIT_TIMEOUT,
-                                    sleep_threshold=self.sleep_threshold,
+                                self._get_file_chunk(
+                                    dc_id, location, next_offset, chunk_size, scheduled
                                 )
                             )
                             pending.append(task)
