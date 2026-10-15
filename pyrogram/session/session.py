@@ -26,7 +26,7 @@ from io import BytesIO
 import pyrogram
 from pyrogram import raw
 from pyrogram.connection import Connection
-from pyrogram.crypto import mtproto
+from pyrogram.crypto import aes, mtproto
 from pyrogram.errors import (
     RPCError, InternalServerError, AuthKeyDuplicated,
     FloodWait, FloodPremiumWait,
@@ -47,7 +47,10 @@ class Result:
 
 
 class Session:
-    START_TIMEOUT = 1
+    # Ping and InitConnection right after the socket opens. One second is shorter than a
+    # single round trip on a congested or long route (mobile data, India <-> EU DCs), which
+    # made healthy connections look dead and sent them round the reconnect loop again and again.
+    START_TIMEOUT = float(os.environ.get("PYROGRAM_START_TIMEOUT", 3))
     WAIT_TIMEOUT = 15
     # Timeout for large media transfers (GetFile / SaveFilePart). With many 1 MB requests in
     # flight on a slow or high-latency route, 15 s is too short and causes needless retries.
@@ -112,8 +115,19 @@ class Session:
         # drop the session and build a fresh one instead of reusing a dead connection forever.
         self.failure = None
 
+        # asyncio keeps only weak references to tasks. Fire-and-forget packet handlers used to
+        # be collectable mid-flight, silently dropping the response they were processing.
+        self._tasks = set()
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = self.client.loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def start(self):
+        attempt = 0
+
         while True:
             self.connection = Connection(
                 self.dc_id,
@@ -164,6 +178,10 @@ class Session:
                 raise e
             except (OSError, TimeoutError, RPCError):
                 await self.stop()
+
+                # Back off instead of hammering a DC that is refusing or throttling us
+                attempt += 1
+                await asyncio.sleep(min(0.25 * 2 ** (attempt - 1), 4))
             except Exception as e:
                 await self.stop()
                 raise e
@@ -218,15 +236,20 @@ class Session:
 
     async def handle_packet(self, packet):
         try:
-            data = await self.client.loop.run_in_executor(
-                pyrogram.crypto_executor,
-                mtproto.unpack,
-                BytesIO(packet),
-                self.session_id,
-                self.auth_key,
-                self.auth_key_id,
-                # self.stored_msg_ids
-            )
+            if aes.is_inline(len(packet)):
+                data = mtproto.unpack(
+                    BytesIO(packet), self.session_id, self.auth_key, self.auth_key_id
+                )
+            else:
+                data = await self.client.loop.run_in_executor(
+                    pyrogram.crypto_executor,
+                    mtproto.unpack,
+                    BytesIO(packet),
+                    self.session_id,
+                    self.auth_key,
+                    self.auth_key_id,
+                    # self.stored_msg_ids
+                )
         except SecurityCheckMismatch:
             return
 
@@ -259,7 +282,11 @@ class Session:
                     if msg.msg_id < self.stored_msg_ids[0]:
                         raise SecurityCheckMismatch("The msg_id is lower than all the stored values")
 
-                    if msg.msg_id in self.stored_msg_ids:
+                    # stored_msg_ids is kept sorted, so a binary search replaces a linear scan
+                    # (12.6 us -> 0.3 us per message with the full 2000 ids)
+                    pos = bisect.bisect_left(self.stored_msg_ids, msg.msg_id)
+
+                    if pos < len(self.stored_msg_ids) and self.stored_msg_ids[pos] == msg.msg_id:
                         raise SecurityCheckMismatch("The msg_id is equal to any of the stored values")
 
                     time_diff = (msg.msg_id - MsgId()) / 2 ** 32
@@ -294,7 +321,7 @@ class Session:
                 msg_id = msg.body.msg_id
             else:
                 if self.client is not None:
-                    self.client.loop.create_task(self.client.handle_updates(msg.body))
+                    self._spawn(self.client.handle_updates(msg.body))
 
             if msg_id in self.results:
                 self.results[msg_id].value = getattr(msg.body, "result", msg.body)
@@ -343,13 +370,24 @@ class Session:
                     log.warning(f'Server sent "{Int.read(BytesIO(packet))}"')
 
                 if self.is_connected.is_set():
-                    self.client.loop.create_task(self._background_restart())
+                    self._spawn(self._background_restart())
 
                 break
 
-            self.client.loop.create_task(self.handle_packet(packet))
+            self._spawn(self.handle_packet(packet))
 
         log.info("NetworkTask stopped")
+
+    @staticmethod
+    def _payload_size(data: TLObject) -> int:
+        """Cheap size estimate for a request: only requests that carry a `bytes` blob (file parts)
+        can be large, everything else is a few hundred bytes."""
+        while isinstance(data, Session.CUR_ALWD_INNR_QRYS):
+            data = data.query
+
+        blob = getattr(data, "bytes", None)
+
+        return len(blob) if isinstance(blob, (bytes, bytearray)) else 0
 
     async def send(
         self,
@@ -368,15 +406,20 @@ class Session:
         log.debug(f"Sent:")
         log.debug(message)
 
-        payload = await self.client.loop.run_in_executor(
-            pyrogram.crypto_executor,
-            mtproto.pack,
-            message,
-            self.salt,
-            self.session_id,
-            self.auth_key,
-            self.auth_key_id
-        )
+        if aes.is_inline(self._payload_size(data)):
+            payload = mtproto.pack(
+                message, self.salt, self.session_id, self.auth_key, self.auth_key_id
+            )
+        else:
+            payload = await self.client.loop.run_in_executor(
+                pyrogram.crypto_executor,
+                mtproto.pack,
+                message,
+                self.salt,
+                self.session_id,
+                self.auth_key,
+                self.auth_key_id
+            )
 
         try:
             await self.connection.send(payload)
@@ -460,5 +503,7 @@ class Session:
 
                 await asyncio.sleep(0.5)
 
-                return await self.invoke(query, retries - 1, timeout)
+                # sleep_threshold must be carried over, or the retry silently falls back to the
+                # default and a FloodWait the caller chose to wait out is raised instead
+                return await self.invoke(query, retries - 1, timeout, sleep_threshold)
         raise TimeoutError("Exceeded maximum number of retries")
