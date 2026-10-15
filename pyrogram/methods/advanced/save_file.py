@@ -37,6 +37,39 @@ log = logging.getLogger(__name__)
 # Attempts per upload part; retries are sent over a different connection when possible
 PART_RETRIES = max(1, int(os.environ.get("PYROGRAM_PART_RETRIES", 4)))
 
+# Upload requests kept in flight per connection. One request per connection makes the speed
+# connections / round-trip-time (8 connections at 150 ms RTT cannot exceed ~27 MB/s however fast the
+# link is); several in flight hide the round trip, exactly as the download pipeline does.
+# PYROGRAM_UL_DEPTH=<n> (1 restores one request per connection)
+UPLOAD_DEPTH = max(1, int(os.environ.get("PYROGRAM_UL_DEPTH", 2)))
+
+# Parts read from disk per call. Reads run on a worker thread so a slow disk, network mount or
+# SD card cannot freeze the event loop (and with it every other transfer and handler).
+READ_BLOCK_PARTS = 8
+
+
+def _read_full(fp, size: int) -> bytes:
+    """Read exactly `size` bytes, or fewer only at EOF. A short read in the middle of the file
+    would shift every following part boundary and corrupt the upload."""
+    data = fp.read(size)
+
+    if len(data) == size or not data:
+        return data
+
+    chunks = [data]
+    remaining = size - len(data)
+
+    while remaining > 0:
+        more = fp.read(remaining)
+
+        if not more:
+            break
+
+        chunks.append(more)
+        remaining -= len(more)
+
+    return b"".join(chunks)
+
 
 class SaveFile:
     async def _get_upload_sessions(self, count: int) -> list[Session]:
@@ -221,24 +254,43 @@ class SaveFile:
 
             sessions = await self._get_upload_sessions(workers_count)
 
+            # UPLOAD_DEPTH workers per connection: each owns one request in flight on it
+            tasks_count = 1 if is_missing_part else min(len(sessions) * UPLOAD_DEPTH, file_total_parts)
+
             # Bounded queue prevents loading large files entirely into RAM
-            queue: asyncio.Queue = asyncio.Queue(maxsize=workers_count * 2)
+            queue: asyncio.Queue = asyncio.Queue(maxsize=tasks_count * 2)
             errors: list = []
-            workers = [self.loop.create_task(worker(s, i)) for i, s in enumerate(sessions)]
+            workers = [
+                self.loop.create_task(worker(sessions[i % len(sessions)], i))
+                for i in range(tasks_count)
+            ]
 
             is_coro_progress = inspect.iscoroutinefunction(progress) if progress else False
+
+            # Real files are read a block at a time on a worker thread; in-memory buffers are
+            # already in RAM, so a thread hop would only add latency.
+            offload_reads = not isinstance(fp, (io.BytesIO, io.StringIO))
+            block_size = part_size * (1 if is_missing_part else READ_BLOCK_PARTS)
+
+            async def read_parts():
+                while True:
+                    if offload_reads:
+                        block = await self.loop.run_in_executor(self.executor, _read_full, fp, block_size)
+                    else:
+                        block = _read_full(fp, block_size)
+
+                    if not block:
+                        return
+
+                    for start in range(0, len(block), part_size):
+                        yield block[start:start + part_size]
+
+            parts = read_parts()
 
             try:
                 fp.seek(part_size * file_part)
 
-                while True:
-                    chunk = fp.read(part_size)
-
-                    if not chunk:
-                        if not is_big and not is_missing_part:
-                            md5_sum = md5_sum.hexdigest()
-                        break
-
+                async for chunk in parts:
                     await queue.put((file_part, chunk))
 
                     if errors:
@@ -264,6 +316,10 @@ class SaveFile:
                             await func()
                         else:
                             await self.loop.run_in_executor(self.executor, func)
+                else:
+                    # reached EOF (no break): the checksum is complete
+                    if not is_big and not is_missing_part:
+                        md5_sum = md5_sum.hexdigest()
             except StopTransmission:
                 # Drain pending queue items so sentinel puts never block on cancellation
                 while not queue.empty():
@@ -274,6 +330,8 @@ class SaveFile:
                         break
                 raise
             finally:
+                await parts.aclose()
+
                 if close_fp:
                     fp.close()
 
