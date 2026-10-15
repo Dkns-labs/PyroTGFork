@@ -18,16 +18,19 @@
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from .transport import *
-from ..session.internals import DataCenter
+from .transport.tcp.tcp import TCP
+from ..session.internals import DataCenter, DCRouter
 
 log = logging.getLogger(__name__)
 
 
 class Connection:
     MAX_RETRIES = 3
+    FALLBACK_TIMEOUT = 5
 
     MODES = {
         0: TCPFull,
@@ -50,27 +53,43 @@ class Connection:
 
     async def connect(self):
         for i in range(Connection.MAX_RETRIES):
-            self.protocol = self.mode(self.ipv6, self.proxy)
+            # Healthy endpoints first; the router demotes ones that failed recently.
+            for n, address in enumerate(
+                DCRouter.candidates(self.dc_id, self.test_mode, self.ipv6, self.media)
+            ):
+                self.protocol = self.mode(self.ipv6, self.proxy)
 
-            try:
-                log.info("Connecting...")
-                await self.protocol.connect(self.address)
-            except OSError as e:
-                log.warning(f"Unable to connect due to network issues: {e}")
-                await self.protocol.close()
-                await asyncio.sleep(1)
-            else:
-                log.info("Connected! {} DC{}{} - IPv{} - {}".format(
+                # The preferred route gets the full TCP timeout, fallbacks fail faster.
+                timeout = TCP.TIMEOUT + 2 if n == 0 else Connection.FALLBACK_TIMEOUT
+                started = time.monotonic()
+
+                try:
+                    log.info("Connecting...")
+                    await asyncio.wait_for(self.protocol.connect(address), timeout)
+                except (OSError, asyncio.TimeoutError) as e:
+                    log.warning(f"Unable to connect to {address[0]}:{address[1]} due to network issues: {e!r}")
+                    DCRouter.record_failure(address)
+                    await self.protocol.close()
+                    continue
+
+                DCRouter.record_success(address, time.monotonic() - started)
+                self.address = address
+
+                log.info("Connected! {} DC{}{} - IPv{} - {} - {}:{}".format(
                     "Test" if self.test_mode else "Production",
                     self.dc_id,
                     " (media)" if self.media else "",
                     "6" if self.ipv6 else "4",
                     self.mode.__name__,
+                    address[0],
+                    address[1],
                 ))
-                break
-        else:
-            log.warning("Connection failed! Trying again...")
-            raise TimeoutError
+                return
+
+            await asyncio.sleep(1)
+
+        log.warning("Connection failed! Trying again...")
+        raise TimeoutError
 
     async def close(self):
         if self.protocol is not None:
