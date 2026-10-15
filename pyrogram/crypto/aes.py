@@ -70,6 +70,21 @@ def _load_native():
 
 _native, _label = _load_native()
 
+# True when a compiled backend (hypercrypto / warpcrypto / tgcrypto) is in use
+NATIVE = _native is not None
+
+# Frames up to this many bytes are encrypted/decrypted right on the event loop instead of being
+# handed to crypto_executor. A native cipher needs a few microseconds for them, while the thread
+# hand-off costs ~100 us plus GIL contention, so for acks, pings and ordinary RPCs the hop is the
+# expensive part. Bulk data (file parts, 1 MB chunks) still goes to the executor. Never used with the
+# pure-Python fallback, where even a small frame would stall the loop. 0 disables.
+# PYROGRAM_CRYPTO_INLINE=<bytes>
+INLINE_LIMIT = max(0, int(os.environ.get("PYROGRAM_CRYPTO_INLINE", 4096)))
+
+
+def is_inline(size: int) -> bool:
+    return NATIVE and INLINE_LIMIT > 0 and size <= INLINE_LIMIT
+
 if _native is not None:
     log.info("Using %s", _label)
 
