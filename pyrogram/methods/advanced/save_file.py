@@ -17,12 +17,11 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
-import functools
-import inspect
 import io
 import logging
 import math
 import os
+from collections import deque
 from hashlib import md5
 from pathlib import Path, PurePath
 from typing import BinaryIO, Callable, Optional, Union
@@ -42,6 +41,12 @@ PART_RETRIES = max(1, int(os.environ.get("PYROGRAM_PART_RETRIES", 4)))
 # link is); several in flight hide the round trip, exactly as the download pipeline does.
 # PYROGRAM_UL_DEPTH=<n> (1 restores one request per connection)
 UPLOAD_DEPTH = max(1, int(os.environ.get("PYROGRAM_UL_DEPTH", 2)))
+
+# A part that has not been acknowledged after max(this, 6 x the usual time) is sent again over
+# another connection and the first answer wins (SaveFilePart is idempotent). Without it one silent
+# connection holds its part for the whole request timeout (60 s) and that share of the speed
+# disappears, which shows up as sudden dips. Seconds; 0 disables. PYROGRAM_UL_HEDGE=<s>
+UPLOAD_HEDGE_AFTER = max(0.0, float(os.environ.get("PYROGRAM_UL_HEDGE", 3)))
 
 # Parts read from disk per call. Reads run on a worker thread so a slow disk, network mount or
 # SD card cannot freeze the event loop (and with it every other transfer and handler).
@@ -72,17 +77,31 @@ def _read_full(fp, size: int) -> bytes:
 
 
 class SaveFile:
-    async def _get_upload_sessions(self, count: int) -> list[Session]:
-        """Maintain a persistent pool of warm media upload sessions to avoid repeated TCP/MTProto handshakes."""
+    async def _start_upload_session(self, dc_id, auth_key, test_mode):
+        session = Session(self, dc_id, auth_key, test_mode, is_media=True)
+
+        try:
+            await session.start()
+        except Exception as e:
+            log.warning("Upload session failed to start: %r", e)
+            return None
+
+        self._upload_session_pool.append(session)
+        return session
+
+    async def _get_upload_sessions(self, count: int, wait_all: bool = False) -> list[Session]:
+        """Warm media upload sessions, so repeated uploads skip the TCP/MTProto handshakes.
+
+        Returns as soon as one session is usable and lets the rest connect in the background
+        (`wait_all=True` waits for all of them). Waiting for every handshake first meant one slow
+        or failing connection delayed the whole upload by seconds.
+        """
         if not hasattr(self, "_upload_session_pool"):
             self._upload_session_pool = []
+            self._upload_starting = set()
             self._upload_pool_lock = asyncio.Lock()
 
         async with self._upload_pool_lock:
-            dc_id = await self.storage.dc_id()
-            auth_key = await self.storage.auth_key()
-            test_mode = await self.storage.test_mode()
-
             # Only hand out sessions that are connected right now. (`is_connected` is an
             # asyncio.Event, so it must be checked with is_set(), never by truthiness.)
             # A reconnecting session heals itself and is reused once it is back.
@@ -92,29 +111,39 @@ class SaveFile:
                 self._spawn(self._quiet_stop(dead))
 
             usable = [s for s in self._upload_session_pool if s.is_connected.is_set()]
+            missing = count - len(usable) - len(self._upload_starting)
 
-            # Spawn missing sessions in parallel; one failing to start must not lose the rest
-            missing = count - len(usable)
             if missing > 0:
-                new_sessions = [
-                    Session(self, dc_id, auth_key, test_mode, is_media=True)
-                    for _ in range(missing)
-                ]
-                results = await asyncio.gather(
-                    *(s.start() for s in new_sessions), return_exceptions=True
-                )
+                dc_id = await self.storage.dc_id()
+                auth_key = await self.storage.auth_key()
+                test_mode = await self.storage.test_mode()
 
-                for s, res in zip(new_sessions, results):
-                    if isinstance(res, BaseException):
-                        log.warning("Upload session failed to start: %r", res)
-                    else:
-                        self._upload_session_pool.append(s)
-                        usable.append(s)
+                for _ in range(missing):
+                    task = self._spawn(self._start_upload_session(dc_id, auth_key, test_mode))
+                    self._upload_starting.add(task)
+                    task.add_done_callback(self._upload_starting.discard)
 
-            if not usable:
-                raise ConnectionError("No upload session could be started")
-
+        if usable and not wait_all:
             return usable[:count]
+
+        # Nothing warm yet (or the caller wants the full set): wait for the first / all of them
+        waiting = set(self._upload_starting)
+
+        while waiting:
+            _, waiting = await asyncio.wait(
+                waiting, return_when=asyncio.ALL_COMPLETED if wait_all else asyncio.FIRST_COMPLETED
+            )
+            usable = [s for s in self._upload_session_pool if s.is_connected.is_set()]
+
+            if usable and not wait_all:
+                break
+
+        usable = [s for s in self._upload_session_pool if s.is_connected.is_set()]
+
+        if not usable:
+            raise ConnectionError("No upload session could be started")
+
+        return usable[:count]
 
     async def save_file(
         self: "pyrogram.Client",
@@ -135,6 +164,9 @@ class SaveFile:
         async with self.save_file_semaphore:
             if path is None:
                 return None
+
+            done_bytes = [0]  # bytes Telegram has acknowledged (progress follows this, not the read side)
+            reporter = None
 
             async def send_part(session: Session, part_index: int, chunk: bytes):
                 if is_big:
@@ -158,6 +190,63 @@ class SaveFile:
                     sleep_threshold=self.sleep_threshold,
                 )
 
+            times = deque(maxlen=32)  # how long recent parts took end to end
+
+            def hedge_after() -> float:
+                if not UPLOAD_HEDGE_AFTER:
+                    return 0
+
+                if len(times) < 4:
+                    return UPLOAD_HEDGE_AFTER * 3  # no pace known yet
+
+                return max(UPLOAD_HEDGE_AFTER, 6 * sorted(times)[len(times) // 2])
+
+            async def send_hedged(target: Session, part_index: int, chunk: bytes, position: int):
+                """send_part(), racing a second copy over another connection if it stalls."""
+                started = self.loop.time()
+                task = self.loop.create_task(send_part(target, part_index, chunk))
+                racers = {task}
+                error = None
+
+                try:
+                    done, _ = await asyncio.wait(racers, timeout=hedge_after() or None)
+
+                    if not done:
+                        others = [
+                            s for s in sessions
+                            if s is not target and s.failure is None and s.is_connected.is_set()
+                        ]
+
+                        if others:
+                            log.info("Upload of part %s stalled on one connection: racing it on another",
+                                     part_index)
+                            racers.add(self.loop.create_task(
+                                send_part(others[(position + part_index) % len(others)], part_index, chunk)
+                            ))
+
+                    while racers:
+                        done, _ = await asyncio.wait(racers, return_when=asyncio.FIRST_COMPLETED)
+
+                        for t in done:
+                            racers.discard(t)
+
+                            if t.cancelled():
+                                continue
+
+                            exc = t.exception()
+
+                            if exc is None:
+                                times.append(self.loop.time() - started)
+                                return
+
+                            error = exc
+
+                    raise error if error is not None else TimeoutError("upload part was cancelled")
+                finally:
+                    for t in racers:
+                        t.cancel()
+                        t.add_done_callback(lambda x: x.cancelled() or x.exception())
+
             async def worker(session: Session, position: int):
                 while True:
                     data = await queue.get()
@@ -169,8 +258,9 @@ class SaveFile:
                     part_index, chunk = data
 
                     try:
-                        # The upload is already lost: don't spend bandwidth on the remaining parts
-                        if errors:
+                        # The upload is already lost (or was stopped from the progress callback):
+                        # don't spend bandwidth on the remaining parts
+                        if errors or (reporter is not None and reporter.error is not None):
                             continue
 
                         last_error = None
@@ -182,8 +272,13 @@ class SaveFile:
                                 candidates[(position + attempt) % len(candidates)]
 
                             try:
-                                await send_part(target, part_index, chunk)
+                                await send_hedged(target, part_index, chunk, position)
                                 last_error = None
+                                done_bytes[0] += len(chunk)
+
+                                if reporter is not None:
+                                    reporter.poke()
+
                                 break
                             except (OSError, TimeoutError, asyncio.TimeoutError, InternalServerError,
                                     ServiceUnavailable) as e:
@@ -255,17 +350,49 @@ class SaveFile:
             sessions = await self._get_upload_sessions(workers_count)
 
             # UPLOAD_DEPTH workers per connection: each owns one request in flight on it
+            planned = 1 if is_missing_part else min(workers_count * UPLOAD_DEPTH, file_total_parts)
             tasks_count = 1 if is_missing_part else min(len(sessions) * UPLOAD_DEPTH, file_total_parts)
 
             # Bounded queue prevents loading large files entirely into RAM
-            queue: asyncio.Queue = asyncio.Queue(maxsize=tasks_count * 2)
+            queue: asyncio.Queue = asyncio.Queue(maxsize=planned * 2)
             errors: list = []
             workers = [
                 self.loop.create_task(worker(sessions[i % len(sessions)], i))
                 for i in range(tasks_count)
             ]
 
-            is_coro_progress = inspect.iscoroutinefunction(progress) if progress else False
+            async def join_late_sessions():
+                """Connections that were still handshaking when the upload started join it as
+                soon as they are up; the upload itself never waits for them."""
+                try:
+                    everyone = await self._get_upload_sessions(workers_count, wait_all=True)
+                except Exception as e:
+                    log.warning("Extra upload sessions unavailable: %r", e)
+                    return
+
+                for s in everyone:
+                    if s not in sessions and len(workers) < planned:
+                        sessions.append(s)
+
+                        for _ in range(UPLOAD_DEPTH):
+                            if len(workers) < planned:
+                                workers.append(self.loop.create_task(worker(s, len(workers))))
+
+            joiner = (
+                self.loop.create_task(join_late_sessions())
+                if not is_missing_part and len(sessions) < workers_count
+                else None
+            )
+
+            if progress and not is_missing_part:
+                from pyrogram.client import _ProgressReporter  # not at module level: client imports this file
+
+                base = part_size * file_part
+                reporter = _ProgressReporter(
+                    self, progress, progress_args, file_size, lambda: base + done_bytes[0]
+                )
+
+            ok = False
 
             # Real files are read a block at a time on a worker thread; in-memory buffers are
             # already in RAM, so a thread hop would only add latency.
@@ -304,22 +431,15 @@ class SaveFile:
 
                     file_part += 1
 
-                    if progress:
-                        func = functools.partial(
-                            progress,
-                            min(file_part * part_size, file_size),
-                            file_size,
-                            *progress_args,
-                        )
-
-                        if is_coro_progress:
-                            await func()
-                        else:
-                            await self.loop.run_in_executor(self.executor, func)
+                    if reporter is not None:
+                        reporter.check()  # re-raises e.g. StopTransmission from the callback
+                        reporter.poke()
                 else:
                     # reached EOF (no break): the checksum is complete
                     if not is_big and not is_missing_part:
                         md5_sum = md5_sum.hexdigest()
+
+                ok = True
             except StopTransmission:
                 # Drain pending queue items so sentinel puts never block on cancellation
                 while not queue.empty():
@@ -335,14 +455,28 @@ class SaveFile:
                 if close_fp:
                     fp.close()
 
+                # Nobody may add workers while the sentinels go out
+                if joiner is not None:
+                    joiner.cancel()
+                    await asyncio.gather(joiner, return_exceptions=True)
+
                 # Signal all workers to exit cleanly
                 for _ in workers:
                     await queue.put(None)
 
                 await asyncio.gather(*workers, return_exceptions=True)
 
+                if reporter is not None and not ok:
+                    reporter.abort()
+
             if errors:
+                if reporter is not None:
+                    reporter.abort()
+
                 raise errors[0]
+
+            if reporter is not None:
+                await reporter.close()  # final value: every part acknowledged
 
             if is_missing_part:
                 return None
