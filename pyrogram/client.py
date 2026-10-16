@@ -109,6 +109,7 @@ class Client(Methods):
 
     # Optimized default concurrent transmissions for faster parallel uploads & downloads
     MAX_CONCURRENT_TRANSMISSIONS = 8
+    MAX_ACTIVE_TRANSFERS = max(1, int(os.environ.get("PYROGRAM_MAX_TRANSFERS", 64)))
     MAX_CACHE_SIZE = 10000
     DISK_BUFFER_SIZE = 1024 * 1024  # 1 MB disk write buffer
 
@@ -262,12 +263,9 @@ class Client(Methods):
         # Admission control for transfers: at most max_concurrent_transmissions at a time, the
         # next one chosen by MLFQ priority instead of arrival order (pyrogram/transfer/mlfq.py).
         # `async with gate:` still works like the semaphores these replaced.
-        self.save_file_semaphore = TransferGate(
-            self.max_concurrent_transmissions, self.media_pool.policy
-        )
-        self.get_file_semaphore = TransferGate(
-            self.max_concurrent_transmissions, self.media_pool.policy
-        )
+        gate_slots = max(self.max_concurrent_transmissions, self.MAX_ACTIVE_TRANSFERS)
+        self.save_file_semaphore = TransferGate(gate_slots, self.media_pool.policy)
+        self.get_file_semaphore = TransferGate(gate_slots, self.media_pool.policy)
 
         self.is_connected = None
         self.is_initialized = None
@@ -1236,6 +1234,7 @@ class Client(Methods):
         job = self.get_file_semaphore.job(expected, name=f"dl:{file_id.media_id}")
 
         async with self.get_file_semaphore.admit(job):
+            self.media_pool.job_started(file_id.dc_id, job)
             file_type = file_id.file_type
 
             if file_type == FileType.CHAT_PHOTO:
@@ -1413,15 +1412,7 @@ class Client(Methods):
                     scheduled = 1 + len(spec)  # the first chunk and the speculative ones
 
                     def window():
-                        # what the live connections can carry (it follows their adaptive depth)
-                        # plus room to absorb a hiccup on one of them
-                        capacity = pool.capacity(dc_id)
-                        share = self.DOWNLOAD_WINDOW_MAX // max(1, self.get_file_semaphore.active)
-
-                        return max(
-                            min(self.DOWNLOAD_WINDOW_MAX, 2 * capacity),
-                            min(share, capacity * self.DOWNLOAD_BUFFER_FACTOR),
-                        )
+                        return pool.window_for(dc_id, job, self)
 
                     def top_up():
                         nonlocal next_offset, scheduled
