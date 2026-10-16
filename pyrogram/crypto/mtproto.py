@@ -86,8 +86,11 @@ def pack(message: Message, salt: int, session_id: bytes, auth_key: bytes, auth_k
     padding = urandom(-(len(data) + 12) % 16 + 12)
 
     # 88 = 88 + 0 (outgoing message)
-    msg_key_large = sha256(auth_key[88: 88 + 32] + data + padding).digest()
-    msg_key = msg_key_large[8:24]
+    # Hashed incrementally so the (up to 1 MB) message is not copied into one more temporary buffer.
+    digest = sha256(auth_key[88: 88 + 32])
+    digest.update(data)
+    digest.update(padding)
+    msg_key = digest.digest()[8:24]
     aes_key, aes_iv = kdf(auth_key, msg_key, True)
 
     return auth_key_id + msg_key + aes.ige256_encrypt(data + padding, aes_key, aes_iv)
@@ -103,7 +106,8 @@ def unpack(
 
     msg_key = b.read(16)
     aes_key, aes_iv = kdf(auth_key, msg_key, False)
-    data = BytesIO(aes.ige256_decrypt(b.read(), aes_key, aes_iv))
+    plain = aes.ige256_decrypt(b.read(), aes_key, aes_iv)
+    data = BytesIO(plain)
     data.read(8)  # Salt
 
     # https://core.telegram.org/mtproto/security_guidelines#checking-session-id
@@ -125,14 +129,19 @@ def unpack(
 
     # https://core.telegram.org/mtproto/security_guidelines#checking-sha256-hash-value-of-msg-key
     # 96 = 88 + 8 (incoming message)
+    # Hashed incrementally: `auth_key[96:128] + plain` would copy the whole (up to 1 MB) message.
+    digest = sha256(auth_key[96:96 + 32])
+    digest.update(plain)
+
     SecurityCheckMismatch.check(
-        msg_key == sha256(auth_key[96:96 + 32] + data.getvalue()).digest()[8:24],
+        msg_key == digest.digest()[8:24],
         "msg_key == sha256(auth_key[96:96 + 32] + data.getvalue()).digest()[8:24]"
     )
 
     # https://core.telegram.org/mtproto/security_guidelines#checking-message-length
-    data.seek(32)  # Get to the payload, skip salt (8) + session_id (8) + msg_id (8) + seq_no (4) + length (4)
-    payload = data.read()
+    # Skip salt (8) + session_id (8) + msg_id (8) + seq_no (4) + length (4) to get to the payload.
+    # A memoryview slices exactly like bytes does, without copying the payload.
+    payload = memoryview(plain)[32:]
     padding = payload[message.length:]
     SecurityCheckMismatch.check(12 <= len(padding) <= 1024, "12 <= len(padding) <= 1024")
     SecurityCheckMismatch.check(len(payload) % 4 == 0, "len(payload) % 4 == 0")
