@@ -16,7 +16,8 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+from .mlfq import Job, Policy, TransferGate
 from .pool import MediaPool
 from .progress import ProgressReporter
 
-__all__ = ["MediaPool", "ProgressReporter"]
+__all__ = ["MediaPool", "ProgressReporter", "TransferGate", "Job", "Policy"]

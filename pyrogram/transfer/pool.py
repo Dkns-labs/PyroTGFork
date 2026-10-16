@@ -23,7 +23,10 @@ One `MediaPool` owns every media session of a client. Both directions go through
 which gives them the same behaviour:
 
 - **Slots.** Every connection accepts a limited number of requests at a time (its *depth*).
-  Further requests wait, in order, for the next free slot.
+  Further requests wait for the next free slot. Waiters are ordered by MLFQ priority (see
+  `pyrogram.transfer.mlfq`): a transfer that has moved little data goes before one that has
+  moved a lot, equal priorities are served in arrival order, and waiting raises the priority
+  (aging). With `PYROGRAM_SCHEDULER=fifo` this is plain arrival order.
 - **Work stealing.** A free slot goes to the connection that would finish the request soonest,
   and a request prefers to wait for a fast connection over being given to a much slower one. A
   connection twice as fast therefore carries about twice the data, and the slowest connection no
@@ -40,13 +43,17 @@ which gives them the same behaviour:
 import asyncio
 import logging
 import os
+import time
 import weakref
 from collections import deque
+from typing import Optional
 
 from pyrogram import raw
 from pyrogram.errors import AuthBytesInvalid, InternalServerError, ServiceUnavailable
 from pyrogram.session import Session
 from pyrogram.session.auth import Auth
+
+from .mlfq import Job, Policy, _Waiter, effective_level
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +71,68 @@ class Conn:
         self.since_change = 0
 
 
+class _WaitQueue:
+    """Requests waiting for a connection slot, grouped by transfer.
+
+    Inside one transfer requests keep their arrival order, so the best candidate of a transfer is
+    always its oldest request; picking the next request to serve therefore only looks at one
+    request per transfer instead of at every queued chunk (a transfer can have dozens waiting).
+    """
+
+    __slots__ = ("groups", "size", "forced")
+
+    def __init__(self):
+        self.groups = {}  # Job -> deque of waiters, oldest first
+        self.size = 0
+        self.forced = set()  # waiters that skip the queue (they only wait for a connection)
+
+    def __len__(self):
+        return self.size
+
+    def add(self, waiter):
+        group = self.groups.get(waiter.job)
+
+        if group is None:
+            group = self.groups[waiter.job] = deque()
+
+        group.append(waiter)
+        self.size += 1
+
+        if waiter.force:
+            self.forced.add(waiter)
+
+    def remove(self, waiter):
+        group = self.groups.get(waiter.job)
+
+        if not group:
+            return
+
+        try:
+            group.remove(waiter)
+        except ValueError:
+            return
+
+        if not group:
+            del self.groups[waiter.job]
+
+        self.size -= 1
+        self.forced.discard(waiter)
+
+    def head(self, policy):
+        """The request that gets the next free slot: best (aged) level first, then arrival order."""
+        best = best_key = None
+        now = time.monotonic()
+
+        for group in self.groups.values():
+            w = group[0]
+            key = (effective_level(w.job.level(now), now - w.since, policy), w.seq)
+
+            if best is None or key < best_key:
+                best, best_key = w, key
+
+        return best
+
+
 class MediaPool:
     RETRIES = max(1, int(os.environ.get("PYROGRAM_CHUNK_RETRIES", 4)))
 
@@ -76,6 +145,12 @@ class MediaPool:
     # under-used (grow), above HIGH requests wait behind each other for nothing (shrink).
     QUEUE_LOW = 1.0
     QUEUE_HIGH = 3.0
+
+    # A request is called stalled (and raced on another connection) once it takes longer than
+    # HEDGE_FACTOR x the 90th percentile of recent request times, but never less than the floor
+    # set by the client (DOWNLOAD_HEDGE_AFTER / UPLOAD_HEDGE_AFTER). PYROGRAM_HEDGE_FACTOR=<x>
+    HEDGE_FACTOR = max(1.1, float(os.environ.get("PYROGRAM_HEDGE_FACTOR", 1.5)))
+    HEDGE_PERCENTILE = min(99, max(50, int(os.environ.get("PYROGRAM_HEDGE_PCT", 90))))
 
     # RPC errors that will not get better by asking again.
     FATAL = ("VOLUME_LOC_NOT_FOUND",)
@@ -94,8 +169,9 @@ class MediaPool:
         self._growth = {}
         self._tasks = set()
         self._conns = weakref.WeakKeyDictionary()
-        self._slot_events = {}
         self._durations = {}
+        self._queues = {}  # dc_id -> _WaitQueue of requests waiting for a slot
+        self.policy = Policy()
 
     # ------------------------------------------------------------------ helpers
 
@@ -347,10 +423,20 @@ class MediaPool:
     # ------------------------------------------------------------------ scheduling
 
     def _wake(self, dc_id: int):
-        event = self._slot_events.get(dc_id)
+        """Wake the request that is next in line for a slot (and the ones that skip the queue)."""
+        queue = self._queues.get(dc_id)
 
-        if event is not None:
-            event.set()
+        if not queue:
+            return
+
+        head = queue.head(self.policy)
+
+        if head is not None and head.wake is not None:
+            head.wake.set()
+
+        for w in queue.forced:
+            if w.wake is not None:
+                w.wake.set()
 
     def best(self, dc_id: int, idx: int, avoid=(), ignore_slots: bool = False):
         """The connection that would finish a new request soonest, or None if none is worth using.
@@ -391,33 +477,63 @@ class MediaPool:
 
         return best
 
-    async def acquire(self, dc_id: int, idx: int, avoid=(), force: bool = False) -> Session:
+    def _head(self, dc_id: int):
+        queue = self._queues.get(dc_id)
+
+        return queue.head(self.policy) if queue else None
+
+    async def acquire(
+        self, dc_id: int, idx: int, avoid=(), force: bool = False, job: Optional[Job] = None
+    ) -> Session:
         """Reserve a request slot on the best connection, waiting while all of them are full.
+
+        Waiting requests are served best priority first (MLFQ, see `job`); requests without a
+        `job` count as level 0 and keep their arrival order. Only the request at the head of the
+        queue is woken when a slot frees up, so the cost of a release does not grow with the
+        number of waiters.
 
         `force` skips the slot limit; used for the duplicate of a stalled request, which must not
         wait behind the very queue it is trying to bypass.
         """
-        event = self._slot_events.get(dc_id)
+        queue = self._queues.get(dc_id)
 
-        if event is None:
-            event = self._slot_events[dc_id] = asyncio.Event()
+        if queue is None:
+            queue = self._queues[dc_id] = _WaitQueue()
 
-        while True:
-            for s in list(self.pools.get(dc_id, ())):
-                if s.failure is not None:
-                    self.evict(dc_id, s)
+        waiter = _Waiter(job or self._anonymous())
+        waiter.wake = asyncio.Event()
+        waiter.force = force
+        queue.add(waiter)
 
-            session = self.best(dc_id, idx, avoid, ignore_slots=force)
+        try:
+            while True:
+                for s in list(self.pools.get(dc_id, ())):
+                    if s.failure is not None:
+                        self.evict(dc_id, s)
 
-            if session is None and not self.pools.get(dc_id):
-                session = await self.primary(dc_id)
+                if force or self._head(dc_id) is waiter:
+                    session = self.best(dc_id, idx, avoid, ignore_slots=force)
 
-            if session is not None:
-                self.conn(session).inflight += 1
-                return session
+                    if session is None and not self.pools.get(dc_id):
+                        session = await self.primary(dc_id)
 
-            event.clear()  # nothing awaited since the check above, so a release cannot be missed
-            await event.wait()
+                    if session is not None:
+                        self.conn(session).inflight += 1
+                        return session
+
+                waiter.wake.clear()  # nothing awaited since the check above, so a release cannot be missed
+                await waiter.wake.wait()
+        finally:
+            queue.remove(waiter)
+            self._wake(dc_id)  # the next in line re-checks now (also after a cancellation)
+
+    def _anonymous(self) -> Job:
+        job = getattr(self, "_anon_job", None)
+
+        if job is None:
+            job = self._anon_job = Job(Policy(enabled=False))
+
+        return job
 
     def release(self, session, dc_id: int, took: float = None):
         c = self.conn(session)
@@ -478,7 +594,7 @@ class MediaPool:
         # A stall is a request much slower than recent ones, not slower than the gaps between
         # answers (parallel connections make those tiny even on a slow link, which would hedge
         # everything). Slow but steady links raise the bar by themselves.
-        return max(floor, 2.5 * sorted(seen)[len(seen) * 3 // 4])
+        return max(floor, self.HEDGE_FACTOR * sorted(seen)[len(seen) * self.HEDGE_PERCENTILE // 100])
 
     def _record(self, dc_id: int, rpc, took: float):
         seen = self._durations.get((dc_id, type(rpc)))
@@ -554,17 +670,20 @@ class MediaPool:
 
                 self.release(s, dc_id, took)
 
-    async def request(self, dc_id: int, rpc, *, idx: int = 0, avoid=(), force: bool = False):
+    async def request(
+        self, dc_id: int, rpc, *, idx: int = 0, avoid=(), force: bool = False, job: Optional[Job] = None
+    ):
         """Send `rpc` over the best connection of a DC, with hedging and failover to other ones.
 
         `idx` only spreads equal choices; `avoid` lists connections to stay away from; `force` skips
-        the slot limit (used for the first burst, before the extra connections exist).
+        the slot limit (used for the first burst, before the extra connections exist); `job` is the
+        transfer the request belongs to, which decides its place in the queue for a slot.
         """
         last_error = None
         tried = []
 
         for attempt in range(self.RETRIES):
-            session = await self.acquire(dc_id, idx + attempt, (*avoid, *tried), force=force)
+            session = await self.acquire(dc_id, idx + attempt, (*avoid, *tried), force=force, job=job)
 
             try:
                 return await self._race(dc_id, session, rpc, idx + attempt, (*avoid, *tried))
