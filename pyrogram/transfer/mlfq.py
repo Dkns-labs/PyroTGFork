@@ -107,7 +107,7 @@ _sequence = itertools.count()
 class Job:
     """One transfer (a download or an upload) as the scheduler sees it."""
 
-    __slots__ = ("policy", "size", "served", "seq", "boosted_at", "name")
+    __slots__ = ("policy", "size", "served", "seq", "boosted_at", "name", "inflight", "on_finish")
 
     def __init__(self, policy: Policy, size: int = 0, name: str = ""):
         self.policy = policy
@@ -116,6 +116,14 @@ class Job:
         self.seq = next(_sequence)
         self.boosted_at = time.monotonic()
         self.name = name
+        self.inflight = 0  # requests of this transfer holding a connection slot
+        self.on_finish = None  # called once when the transfer leaves the gate
+
+    def finish(self):
+        cb, self.on_finish = self.on_finish, None
+
+        if cb is not None:
+            cb(self)
 
     def add(self, nbytes: int):
         self.served += nbytes
@@ -256,4 +264,8 @@ class _Admission:
         return self.job
 
     async def __aexit__(self, *exc):
-        self.gate.release()
+        try:
+            if self.job is not None:
+                self.job.finish()
+        finally:
+            self.gate.release()
