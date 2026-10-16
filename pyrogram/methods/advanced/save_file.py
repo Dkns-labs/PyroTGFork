@@ -66,6 +66,25 @@ def _read_full(fp, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _expected_size(path, part_size: int, file_part: int) -> int:
+    """Best-effort size of what an upload is going to send, for the scheduler (0 = unknown)."""
+    try:
+        if isinstance(path, (str, PurePath)):
+            total = os.path.getsize(path)
+        elif isinstance(path, (io.BytesIO, io.StringIO)):
+            total = len(path.getvalue())
+        elif isinstance(path, io.IOBase) and path.seekable():
+            here = path.tell()
+            total = path.seek(0, os.SEEK_END)
+            path.seek(here, os.SEEK_SET)
+        else:
+            return 0
+    except (OSError, ValueError):
+        return 0
+
+    return max(0, total - part_size * file_part)
+
+
 class SaveFile:
     async def save_file(
         self: "pyrogram.Client",
@@ -83,9 +102,16 @@ class SaveFile:
         - Persistent warm upload session pooling
         - Bounded async producer-consumer pipeline for minimal RAM footprint
         """
-        async with self.save_file_semaphore:
-            if path is None:
-                return None
+        if path is None:
+            return None
+
+        # What this upload is going to send, so the scheduler can let small ones pass big ones
+        job = self.save_file_semaphore.job(
+            _expected_size(path, 512 * 1024, file_part),
+            name=f"ul:{getattr(path, 'name', path)}",
+        )
+
+        async with self.save_file_semaphore.admit(job):
 
             done_bytes = [0]  # bytes Telegram has acknowledged (progress follows this, not the read side)
             reporter = None
@@ -110,7 +136,8 @@ class SaveFile:
 
                 # The pool picks the connection, re-sends a stalled part elsewhere and retries
                 # failures on other connections; a part is idempotent, so a duplicate is harmless.
-                await pool.request(home_dc, rpc, idx=part_index)
+                await pool.request(home_dc, rpc, idx=part_index, job=job)
+                job.add(len(chunk))  # the more a transfer has moved, the lower its priority
 
             async def worker():
                 while True:
