@@ -222,6 +222,7 @@ class SaveFile:
             # Uploads go to the home DC over the same pool downloads use (warm connections are shared);
             # it returns once the first connection is up and the rest join while parts are flowing.
             home_dc = await self.storage.dc_id()
+            pool.job_started(home_dc, job)
             await pool.ensure(home_dc, workers_count)
 
             tasks_count = 1 if is_missing_part else min(workers_count * UPLOAD_DEPTH, file_total_parts)
