@@ -297,6 +297,8 @@ class FakeSession:
         self.die_after = None
         self.stall = 0.0
         self.delay = 0.0  # simulated round-trip time, applied to every request
+        self.serial = False  # True: one request at a time, like a connection with limited bandwidth
+        self._lock = None
         self.uploaded = {}
         FakeSession.registry.append(self)
 
@@ -326,7 +328,14 @@ class FakeSession:
                 continue
             break
 
-        await asyncio.sleep(self.delay)
+        if self.serial:
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+
+            async with self._lock:
+                await asyncio.sleep(self.delay)
+        else:
+            await asyncio.sleep(self.delay)
 
         if isinstance(query, raw.functions.upload.GetFile):
             if self.stall:
@@ -1264,3 +1273,328 @@ def test_disk_download_is_written_off_the_event_loop_and_intact(monkeypatch, tmp
     with open(path, "rb") as f:
         assert f.read() == blob
     assert threads == {True}  # every write happened on a worker thread
+
+
+# ---------------------------------------------------------------------------------------------
+# Stable upload speed
+# ---------------------------------------------------------------------------------------------
+
+def _upload_file(tmp_path, mb):
+    path = tmp_path / "up.bin"
+    path.write_bytes(os.urandom(int(mb * MB)))
+    return path
+
+
+def test_slow_progress_callback_does_not_throttle_the_upload(monkeypatch, tmp_path):
+    import time
+
+    path = _upload_file(tmp_path, 20)  # 40 parts
+    sessions = [FakeSession() for _ in range(4)]
+    for s in sessions:
+        s.delay = 0.02
+    calls = []
+
+    async def main():
+        client = make_client(monkeypatch)
+
+        async def get_sessions(count, wait_all=False):
+            return sessions[:count]
+
+        client._get_upload_sessions = get_sessions
+
+        async def progress(current, total):
+            calls.append(current)
+            await asyncio.sleep(0.3)
+
+        t = time.monotonic()
+        await client.save_file(str(path), progress=progress)
+        return time.monotonic() - t
+
+    elapsed = run(main())
+
+    # 40 parts x 0.3 s = 12 s if the callback sat in the producer loop (the old behaviour)
+    assert elapsed < 4
+    assert calls[-1] == 20 * MB and calls == sorted(calls)
+
+
+def test_upload_progress_follows_acknowledged_bytes(monkeypatch, tmp_path):
+    path = _upload_file(tmp_path, 12)
+    sessions = [FakeSession() for _ in range(3)]
+    for s in sessions:
+        s.delay = 0.05
+    seen = []
+
+    async def main():
+        client = make_client(monkeypatch)
+
+        async def get_sessions(count, wait_all=False):
+            return sessions[:count]
+
+        client._get_upload_sessions = get_sessions
+
+        async def progress(current, total):
+            acked = sum(len(b) for s in sessions for b in s.uploaded.values())
+            seen.append((current, acked, total))
+
+        await client.save_file(str(path), progress=progress)
+
+    run(main())
+
+    assert all(cur <= acked + 1 for cur, acked, _ in seen), "progress ran ahead of what Telegram accepted"
+    cur, acked, total = seen[-1]
+    assert cur == total == acked  # the last value comes after every part was acknowledged
+
+
+def test_stop_transmission_from_an_upload_progress_callback_stops_the_upload(monkeypatch, tmp_path):
+    path = _upload_file(tmp_path, 40)  # 80 parts
+    sessions = [FakeSession() for _ in range(2)]
+    for s in sessions:
+        s.delay = 0.02
+
+    async def main():
+        client = make_client(monkeypatch)
+
+        async def get_sessions(count, wait_all=False):
+            return sessions[:count]
+
+        client._get_upload_sessions = get_sessions
+
+        async def progress(current, total):
+            if current >= 2 * MB:
+                raise pyrogram.StopTransmission
+
+        await client.save_file(str(path), progress=progress)
+
+    with pytest.raises(pyrogram.StopTransmission):
+        run(main())
+
+    assert sum(len(s.uploaded) for s in sessions) < 40  # nowhere near all 80 parts went out
+
+
+def test_part_stuck_on_a_silent_connection_is_raced_on_another(monkeypatch, tmp_path):
+    import time
+    import pyrogram.methods.advanced.save_file as save_file_module
+
+    monkeypatch.setattr(save_file_module, "UPLOAD_HEDGE_AFTER", 0.1)
+    path = _upload_file(tmp_path, 8)  # 16 parts
+    data = path.read_bytes()
+    sessions = [FakeSession() for _ in range(3)]
+
+    original = sessions[1].invoke
+
+    async def silent(query, *a, **k):
+        await asyncio.sleep(30)  # alive but never answers (the real timeout is 60 s)
+        return await original(query, *a, **k)
+
+    sessions[1].invoke = silent
+
+    async def main():
+        client = make_client(monkeypatch)
+
+        async def get_sessions(count, wait_all=False):
+            return sessions[:count]
+
+        client._get_upload_sessions = get_sessions
+        t = time.monotonic()
+        result = await client.save_file(str(path))
+        return result, time.monotonic() - t
+
+    result, elapsed = run(main())
+
+    uploaded = {}
+    for s in sessions:
+        uploaded.update(s.uploaded)
+
+    part = 512 * 1024
+    assert b"".join(uploaded[i] for i in sorted(uploaded)) == data
+    assert result.parts == 16
+    assert elapsed < 5
+
+
+def test_upload_starts_on_the_first_connection_that_is_up(monkeypatch, tmp_path):
+    import pyrogram.methods.advanced.save_file as save_file_module
+
+    monkeypatch.setattr(save_file_module, "Session", FakeSession)
+    path = _upload_file(tmp_path, 6)
+    data = path.read_bytes()
+    events = []
+
+    async def run_it():
+        client = make_client(monkeypatch)
+        monkeypatch.setattr(save_file_module, "Session", FakeSession)
+        counter = [0]
+        original_init = FakeSession.__init__
+
+        def init(self, *a, **k):
+            original_init(self, *a, **k)
+            counter[0] += 1
+            self.n = counter[0]
+
+        async def start(self):
+            await asyncio.sleep(0.05 if self.n == 1 else 1.5)  # the others are slow to connect
+            events.append(("up", self.n))
+
+        original_invoke = FakeSession.invoke
+
+        async def invoke(self, query, *a, **k):
+            events.append(("part", self.n))
+            return await original_invoke(self, query, *a, **k)
+
+        monkeypatch.setattr(FakeSession, "__init__", init)
+        monkeypatch.setattr(FakeSession, "start", start)
+        monkeypatch.setattr(FakeSession, "invoke", invoke)
+
+        await client.save_file(str(path))
+        return client
+
+    client = run(run_it())
+
+    first_part = next(i for i, e in enumerate(events) if e[0] == "part")
+    # The slow connections need 1.5 s; the upload may well be finished before they are up at all
+    slow_up = next((i for i, e in enumerate(events) if e == ("up", 2)), len(events))
+    assert events[0] == ("up", 1) and first_part < slow_up  # parts flowed before the slow ones were up
+
+    uploaded = {}
+    for s in FakeSession.registry:
+        uploaded.update(s.uploaded)
+    assert b"".join(uploaded[i] for i in sorted(uploaded)) == data
+
+
+def test_upload_fails_cleanly_when_no_session_can_start(monkeypatch, tmp_path):
+    import pyrogram.methods.advanced.save_file as save_file_module
+
+    path = _upload_file(tmp_path, 2)
+
+    async def main():
+        client = make_client(monkeypatch)
+        monkeypatch.setattr(save_file_module, "Session", FakeSession)
+
+        async def broken_start(self):
+            raise OSError("no route")
+
+        monkeypatch.setattr(FakeSession, "start", broken_start)
+        await client.save_file(str(path))
+
+    with pytest.raises(ConnectionError):
+        run(main())
+
+
+# ---------------------------------------------------------------------------------------------
+# Uneven connections: the pipeline must not run at the pace of the slowest one
+# ---------------------------------------------------------------------------------------------
+
+def _download_with_speeds(monkeypatch, blob, delays):
+    """get_file over connections whose per-request latency is delays[i] (in creation order)."""
+    made = []
+
+    async def main():
+        client = make_client(monkeypatch)
+        original_init = FakeSession.__init__
+
+        def init(self, *a, **k):
+            original_init(self, *a, **k)
+            self.blobs = {2: blob}
+            self.delay = delays[len(made) % len(delays)]
+            self.serial = True  # each connection serves its requests one after another
+            made.append(self)
+
+        monkeypatch.setattr(FakeSession, "__init__", init)
+
+        async def create(dc_id_):
+            return FakeSession(client, dc_id_)
+
+        client._create_media_session = create
+
+        out = bytearray()
+        t = __import__("time").monotonic()
+        async for chunk in client.get_file(file_id(), len(blob)):
+            out += chunk
+        elapsed = __import__("time").monotonic() - t
+        await client._cancel_background_work()
+        return bytes(out), elapsed
+
+    got, elapsed = run(main())
+    return got, elapsed, made
+
+
+def test_fast_connections_carry_more_chunks_than_slow_ones(monkeypatch):
+    blob = os.urandom(60 * MB)
+    got, _, made = _download_with_speeds(monkeypatch, blob, [0.02, 0.02, 0.4])
+
+    assert got == blob
+    calls = sorted(s.calls for s in made)
+    # round-robin would give every connection a third (20 chunks); the slow one must get far less
+    assert calls[0] < calls[-1] / 3
+
+
+def test_one_slow_connection_does_not_set_the_pace_of_the_download(monkeypatch):
+    blob = os.urandom(36 * MB)
+    got, elapsed, _ = _download_with_speeds(monkeypatch, blob, [0.02, 0.6])  # 3 fast, 3 slow of 6
+
+    assert got == blob
+    # Handing out chunks in turn puts 6 on each slow connection: 6 x 0.6 s = 3.6 s at the very least
+    assert elapsed < 2.2
+
+
+def test_slow_but_steady_link_is_not_hedged_into_double_traffic(monkeypatch):
+    monkeypatch.setattr(Client, "DOWNLOAD_HEDGE_AFTER", 0.1)
+    blob = os.urandom(30 * MB)
+    got, _, made = _download_with_speeds(monkeypatch, blob, [0.4])
+
+    assert got == blob
+    # one GetFile per chunk, nothing sent twice although every request takes 4x the hedge floor
+    assert sum(s.calls for s in made) == 30
+
+
+def test_best_session_prefers_the_soonest_finisher_and_waits_instead_of_picking_a_slow_one(monkeypatch):
+    async def main():
+        client = make_client(monkeypatch)
+        fast, slow = FakeSession(), FakeSession()
+        client.media_session_pool[2] = [fast, slow]
+        client._media_load[fast] = [0, 0.1]
+        client._media_load[slow] = [0, 1.0]
+
+        picks = [client._best_media_session(2, i) for i in range(4)]
+
+        # fast is full; the slow one is free but 10x slower: better to wait for the fast one
+        client._media_load[fast][0] = client.DOWNLOAD_PIPELINE_DEPTH
+        waits = client._best_media_session(2, 0)
+
+        # ... unless the fast one's queue is long enough that the slow one finishes first
+        client._media_load[slow][1] = 0.25
+        takes_slow = client._best_media_session(2, 0)
+
+        return fast, slow, picks, waits, takes_slow
+
+    fast, slow, picks, waits, takes_slow = run(main())
+
+    assert picks == [fast] * 4
+    assert waits is None
+    assert takes_slow is slow
+
+
+def test_slots_are_given_back_when_a_request_fails_or_is_cancelled(monkeypatch):
+    async def main():
+        client = make_client(monkeypatch)
+        a, b = FakeSession(), FakeSession()
+        client.media_session_pool[2] = [a, b]
+
+        a.error = BadRequest(value="[400 FILE_REFERENCE_EXPIRED]")
+        b.error = BadRequest(value="[400 FILE_REFERENCE_EXPIRED]")
+
+        for _ in range(3):
+            try:
+                await client._get_file_chunk(2, None, 0, MB)
+            except BadRequest:
+                pass
+
+        a.error = b.error = None
+        a.delay = b.delay = 5
+        task = asyncio.ensure_future(client._get_file_chunk(2, None, 0, MB))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        return [client._media_state(s)[0] for s in (a, b)]
+
+    assert run(main()) == [0, 0]
