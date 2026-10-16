@@ -125,7 +125,7 @@ class _WaitQueue:
 
         for group in self.groups.values():
             w = group[0]
-            key = (effective_level(w.job.level(now), now - w.since, policy), w.seq)
+            key = (w.job.inflight, effective_level(w.job.level(now), now - w.since, policy), w.seq)
 
             if best is None or key < best_key:
                 best, best_key = w, key
@@ -140,6 +140,10 @@ class MediaPool:
     # PYROGRAM_DEPTH_MAX=<n>; PYROGRAM_ADAPTIVE_DEPTH=0 keeps the starting depth fixed.
     DEPTH_MAX = max(1, int(os.environ.get("PYROGRAM_DEPTH_MAX", 8)))
     ADAPTIVE = os.environ.get("PYROGRAM_ADAPTIVE_DEPTH", "1") != "0"
+
+    CONN_PER_JOB = max(1, int(os.environ.get("PYROGRAM_CONN_PER_JOB", 4)))
+    CONN_MAX = max(1, int(os.environ.get("PYROGRAM_CONN_MAX", 24)))
+    CONN_IDLE = max(5.0, float(os.environ.get("PYROGRAM_CONN_IDLE", 45)))
 
     # Queued requests per connection that adaptive depth aims for: below LOW the connection is
     # under-used (grow), above HIGH requests wait behind each other for nothing (shrink).
@@ -171,6 +175,8 @@ class MediaPool:
         self._conns = weakref.WeakKeyDictionary()
         self._durations = {}
         self._queues = {}  # dc_id -> _WaitQueue of requests waiting for a slot
+        self._active = {}  # dc_id -> {Job, ...}
+        self._trim = {}  # dc_id -> idle-trim task
         self.policy = Policy()
 
     # ------------------------------------------------------------------ helpers
@@ -211,6 +217,60 @@ class MediaPool:
     def capacity(self, dc_id: int) -> int:
         """How many requests the live connections of a DC can have in flight together."""
         return max(1, sum(self.conn(s).depth for s in self.healthy(dc_id)))
+
+    def job_started(self, dc_id: int, job: Job):
+        self._active.setdefault(dc_id, set()).add(job)
+        job.on_finish = lambda j, dc=dc_id: self.job_finished(dc, j)
+
+        t = self._trim.pop(dc_id, None)
+
+        if t is not None:
+            t.cancel()
+
+    def job_finished(self, dc_id: int, job: Job):
+        active = self._active.get(dc_id)
+
+        if active is not None:
+            active.discard(job)
+
+            if not active and dc_id not in self._trim:
+                self._trim[dc_id] = self._spawn(self._trim_idle(dc_id))
+
+        self._wake(dc_id)
+
+    def active_jobs(self, dc_id: int) -> int:
+        return len(self._active.get(dc_id, ()))
+
+    def target_connections(self, dc_id: int) -> int:
+        base = max(1, self.client.DOWNLOAD_CONNECTIONS)
+        n = self.active_jobs(dc_id)
+
+        return max(base, min(max(self.CONN_MAX, base), n * self.CONN_PER_JOB + 2))
+
+    def window_for(self, dc_id: int, job: Job, client=None) -> int:
+        client = client or self.client
+        capacity = self.capacity(dc_id)
+        share = -(-capacity // max(1, self.active_jobs(dc_id)))
+
+        return max(4, min(client.DOWNLOAD_WINDOW_MAX, 2 * share))
+
+    async def _trim_idle(self, dc_id: int):
+        try:
+            await asyncio.sleep(self.CONN_IDLE)
+
+            if self._active.get(dc_id):
+                return
+
+            base = max(1, self.client.DOWNLOAD_CONNECTIONS)
+            pool = self.pools.get(dc_id, [])
+
+            for s in [s for s in pool[base:] if self.conn(s).inflight == 0]:
+                pool.remove(s)
+                self._spawn(self._quiet_stop(s))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._trim.pop(dc_id, None)
 
     # ------------------------------------------------------------------ sessions
 
@@ -311,6 +371,7 @@ class MediaPool:
         Extra sessions reuse the same auth key, so no new authorization export is needed.
         """
         early = False
+        count = max(count, self.target_connections(dc_id))
 
         if count > 1 and dc_id not in self.sessions and not self.pools.get(dc_id):
             # The home DC's auth key is already known, so the extra connections can handshake while
@@ -519,6 +580,7 @@ class MediaPool:
 
                     if session is not None:
                         self.conn(session).inflight += 1
+                        waiter.job.inflight += 1
                         return session
 
                 waiter.wake.clear()  # nothing awaited since the check above, so a release cannot be missed
@@ -684,6 +746,7 @@ class MediaPool:
 
         for attempt in range(self.RETRIES):
             session = await self.acquire(dc_id, idx + attempt, (*avoid, *tried), force=force, job=job)
+            owner = job or self._anonymous()
 
             try:
                 return await self._race(dc_id, session, rpc, idx + attempt, (*avoid, *tried))
@@ -698,6 +761,9 @@ class MediaPool:
                     "%s failed on DC%s (attempt %s/%s): %r",
                     type(rpc).__name__, dc_id, attempt + 1, self.RETRIES, e,
                 )
+            finally:
+                owner.inflight = max(0, owner.inflight - 1)
+                self._wake(dc_id)
 
             await asyncio.sleep(min(0.25 * 2 ** attempt, 2.0))  # after the slot is given back
 
