@@ -71,8 +71,6 @@ class Stop:
 
         # Concurrently close all cached download sessions and pooled upload sessions
         close_tasks = [i.stop() for i in self.media_sessions.values()]
-        if hasattr(self, "_upload_session_pool") and self._upload_session_pool:
-            close_tasks.extend(s.stop() for s in self._upload_session_pool)
 
         primary = list(self.media_sessions.values())
         for pool in self.media_session_pool.values():
@@ -83,8 +81,6 @@ class Stop:
 
         self.media_sessions.clear()
         self.media_session_pool.clear()
-        if hasattr(self, "_upload_session_pool"):
-            self._upload_session_pool.clear()
 
         await self.session.stop()
         await self.storage.save()
