@@ -109,7 +109,7 @@ class Client(Methods):
 
     # Optimized default concurrent transmissions for faster parallel uploads & downloads
     MAX_CONCURRENT_TRANSMISSIONS = 8
-    MAX_ACTIVE_TRANSFERS = max(1, int(os.environ.get("PYROGRAM_MAX_TRANSFERS", 64)))
+    MAX_ACTIVE_TRANSFERS = max(1, int(os.environ.get("PYROGRAM_MAX_TRANSFERS", 32)))
     MAX_CACHE_SIZE = 10000
     DISK_BUFFER_SIZE = 1024 * 1024  # 1 MB disk write buffer
 
