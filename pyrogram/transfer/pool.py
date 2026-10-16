@@ -141,8 +141,8 @@ class MediaPool:
     DEPTH_MAX = max(1, int(os.environ.get("PYROGRAM_DEPTH_MAX", 8)))
     ADAPTIVE = os.environ.get("PYROGRAM_ADAPTIVE_DEPTH", "1") != "0"
 
-    CONN_PER_JOB = max(1, int(os.environ.get("PYROGRAM_CONN_PER_JOB", 4)))
-    CONN_MAX = max(1, int(os.environ.get("PYROGRAM_CONN_MAX", 24)))
+    CONN_PER_JOB = max(1, int(os.environ.get("PYROGRAM_CONN_PER_JOB", 2)))
+    CONN_MAX = max(1, int(os.environ.get("PYROGRAM_CONN_MAX", 8)))
     CONN_IDLE = max(5.0, float(os.environ.get("PYROGRAM_CONN_IDLE", 45)))
 
     # Queued requests per connection that adaptive depth aims for: below LOW the connection is
