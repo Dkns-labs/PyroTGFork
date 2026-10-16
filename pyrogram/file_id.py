@@ -473,6 +473,12 @@ class FileId:
                     )
                 )
 
+        elif self.file_type in DOCUMENT_TYPES and not self.file_reference:
+            # Legacy document ids (no file reference) carry the version a second time, as two
+            # 32-bit integers, before the usual two version bytes. Without it an old id no longer
+            # encodes back to itself.
+            buffer.extend(struct.pack("<ii", minor, major))
+
         buffer.extend(struct.pack("<bb", minor, major))
 
         return b64_encode(rle_encode(buffer))

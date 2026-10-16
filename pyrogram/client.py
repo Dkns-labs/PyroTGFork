@@ -72,7 +72,7 @@ from .file_id import FileId, FileType, ThumbnailSource
 from .mime_types import mime_types
 from .parser import Parser
 from .session.internals import MsgId
-from .transfer import MediaPool, ProgressReporter
+from .transfer import MediaPool, ProgressReporter, TransferGate
 
 log = logging.getLogger(__name__)
 
@@ -121,7 +121,10 @@ class Client(Methods):
     # stalls the whole download even while the others are idle. When the next chunk takes
     # much longer than the recent pace, the same request is raced on another connection and
     # whichever answers first wins. PYROGRAM_DL_HEDGE = minimum stall in seconds (0 disables).
-    DOWNLOAD_HEDGE_AFTER = max(0.0, float(os.environ.get("PYROGRAM_DL_HEDGE", 1.5)))
+    # The floor is deliberately low: the real trigger is a multiple of the recent request times
+    # (see MediaPool.HEDGE_FACTOR), so a slow but steady link is never hedged into double traffic,
+    # while one silent connection no longer freezes the speed for seconds.
+    DOWNLOAD_HEDGE_AFTER = max(0.0, float(os.environ.get("PYROGRAM_DL_HEDGE", 0.5)))
 
     # Same for upload parts (SaveFilePart): minimum stall in seconds before a part is re-sent
     # over another connection. PYROGRAM_UL_HEDGE (0 disables).
@@ -130,7 +133,14 @@ class Client(Methods):
     # How far past the in-order position the pipeline may run, as a multiple of the requests
     # that fit on the connections. The extra room absorbs a hiccup on one connection without
     # the pipeline running dry (and then bursting); it costs about 1 MiB of RAM per request.
-    DOWNLOAD_BUFFER_FACTOR = max(1, int(os.environ.get("PYROGRAM_DL_BUFFER", 2)))
+    # Chunks complete out of order but are handed over in order, so one slow chunk holds back
+    # everything behind it. The buffer must be deep enough to keep every connection busy while the
+    # slow one is re-sent: with too little room the connections go idle and the speed drops to
+    # (almost) zero, then jumps when the stuck chunk arrives. That is the 4 -> 10 -> 30 MB/s pattern.
+    # A single download may use up to DOWNLOAD_WINDOW_MAX MiB for it; with several transfers
+    # running the budget is shared (never below 2x the requests that fit on the connections).
+    DOWNLOAD_BUFFER_FACTOR = max(1, int(os.environ.get("PYROGRAM_DL_BUFFER", 4)))
+    DOWNLOAD_WINDOW_MAX = max(8, int(os.environ.get("PYROGRAM_DL_WINDOW_MAX", 64)))
 
     # If a download ends short (a connection pool collapsed, a DC hiccup), pick it up again
     # from the last whole MiB instead of throwing away everything already received.
@@ -249,11 +259,14 @@ class Client(Methods):
         self.media_session_pool = self.media_pool.pools  # dc_id -> [Session, ...] parallel connections
         self.media_sessions_lock = self.media_pool.lock
 
-        self.save_file_semaphore = asyncio.Semaphore(
-            self.max_concurrent_transmissions
+        # Admission control for transfers: at most max_concurrent_transmissions at a time, the
+        # next one chosen by MLFQ priority instead of arrival order (pyrogram/transfer/mlfq.py).
+        # `async with gate:` still works like the semaphores these replaced.
+        self.save_file_semaphore = TransferGate(
+            self.max_concurrent_transmissions, self.media_pool.policy
         )
-        self.get_file_semaphore = asyncio.Semaphore(
-            self.max_concurrent_transmissions
+        self.get_file_semaphore = TransferGate(
+            self.max_concurrent_transmissions, self.media_pool.policy
         )
 
         self.is_connected = None
@@ -1212,7 +1225,17 @@ class Client(Methods):
 
         ``offset`` and ``limit`` are counted in 1 MiB units regardless of the request size.
         """
-        async with self.get_file_semaphore:
+        # What this call is going to move, so the scheduler can let small transfers pass big ones
+        expected = max(0, file_size - abs(offset) * self.FILE_UNIT) if file_size else 0
+
+        if limit and expected:
+            expected = min(expected, abs(limit) * self.FILE_UNIT)
+        elif limit and not expected:
+            expected = abs(limit) * self.FILE_UNIT
+
+        job = self.get_file_semaphore.job(expected, name=f"dl:{file_id.media_id}")
+
+        async with self.get_file_semaphore.admit(job):
             file_type = file_id.file_type
 
             if file_type == FileType.CHAT_PHOTO:
@@ -1294,7 +1317,9 @@ class Client(Methods):
 
             def count(task):
                 if not task.cancelled() and task.exception() is None:
-                    received[0] += len(getattr(task.result(), "bytes", b""))
+                    n = len(getattr(task.result(), "bytes", b""))
+                    received[0] += n
+                    job.add(n)  # the more a transfer has moved, the lower its priority
 
             def launch(at, idx, burst=False):
                 # `burst`: the first requests go out before the extra connections exist, so they
@@ -1305,6 +1330,7 @@ class Client(Methods):
                         raw.functions.upload.GetFile(location=location, offset=at, limit=chunk_size),
                         idx=idx,
                         force=burst,
+                        job=job,
                     )
                 )
                 task.add_done_callback(count)
@@ -1389,7 +1415,13 @@ class Client(Methods):
                     def window():
                         # what the live connections can carry (it follows their adaptive depth)
                         # plus room to absorb a hiccup on one of them
-                        return min(64, pool.capacity(dc_id) * self.DOWNLOAD_BUFFER_FACTOR)
+                        capacity = pool.capacity(dc_id)
+                        share = self.DOWNLOAD_WINDOW_MAX // max(1, self.get_file_semaphore.active)
+
+                        return max(
+                            min(self.DOWNLOAD_WINDOW_MAX, 2 * capacity),
+                            min(share, capacity * self.DOWNLOAD_BUFFER_FACTOR),
+                        )
 
                     def top_up():
                         nonlocal next_offset, scheduled
