@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import weakref
 import shutil
 import sys
 from typing import AsyncGenerator, Callable, Optional, Tuple, Union
@@ -119,7 +120,12 @@ class Client(Methods):
     # stalls the whole download even while the others are idle. When the next chunk takes
     # much longer than the recent pace, the same request is raced on another connection and
     # whichever answers first wins. PYROGRAM_DL_HEDGE = minimum stall in seconds (0 disables).
-    DOWNLOAD_HEDGE_AFTER = max(0.0, float(os.environ.get("PYROGRAM_DL_HEDGE", 4)))
+    DOWNLOAD_HEDGE_AFTER = max(0.0, float(os.environ.get("PYROGRAM_DL_HEDGE", 1.5)))
+
+    # How far past the in-order position the pipeline may run, as a multiple of the requests
+    # that fit on the connections. The extra room absorbs a hiccup on one connection without
+    # the pipeline running dry (and then bursting); it costs about 1 MiB of RAM per request.
+    DOWNLOAD_BUFFER_FACTOR = max(1, int(os.environ.get("PYROGRAM_DL_BUFFER", 2)))
 
     # If a download ends short (a connection pool collapsed, a DC hiccup), pick it up again
     # from the last whole MiB instead of throwing away everything already received.
@@ -238,6 +244,8 @@ class Client(Methods):
         self._dc_locks = {}  # dc_id -> asyncio.Lock, serializes media session creation per DC
         self._media_growth_tasks = {}  # dc_id -> background task growing the download pool
         self._bg_tasks = set()
+        self._media_load = weakref.WeakKeyDictionary()  # session -> [requests in flight, seconds per request]
+        self._slot_events = {}  # dc_id -> Event set whenever a connection frees a request slot
 
         self.save_file_semaphore = asyncio.Semaphore(
             self.max_concurrent_transmissions
@@ -1357,51 +1365,142 @@ class Client(Methods):
 
         self._media_growth_tasks.clear()
 
-    async def _pick_media_session(self, dc_id: int, idx: int, attempt: int) -> Session:
-        """Round-robin over healthy sessions; a retry lands on a different connection."""
-        for s in list(self.media_session_pool.get(dc_id, ())):
-            if s.failure is not None:
-                self._evict_media_session(dc_id, s)
+    def _media_state(self, session) -> list:
+        st = self._media_load.get(session)
 
-        pool = self.media_session_pool.get(dc_id)
+        if st is None:
+            st = self._media_load[session] = [0, None]
 
-        if pool:
-            n = len(pool)
+        return st
 
-            for k in range(n):
-                s = pool[(idx + attempt + k) % n]
+    def _best_media_session(self, dc_id: int, idx: int, avoid=(), ignore_slots: bool = False):
+        """The connection that would finish a new request soonest, or None if every one is full.
 
-                if s.is_connected.is_set():
-                    return s
+        Estimated finish time = (requests already in flight + 1) x its recent seconds per request, so
+        a connection that is twice as fast is given about twice the chunks, instead of an equal
+        share that lets the slowest connection set the pace of the whole download.
+        """
+        pool = [s for s in self.media_session_pool.get(dc_id, ()) if s.failure is None]
 
-            return pool[(idx + attempt) % n]  # all reconnecting: invoke() waits for one
+        if not pool:
+            return None
 
-        return await self._get_media_session(dc_id)
+        known = [st[1] for s in pool if (st := self._media_load.get(s)) and st[1]]
+        default = sum(known) / len(known) if known else 1.0
 
-    async def _get_file_chunk(self, dc_id: int, location, offset: int, limit: int, idx: int = 0):
+        connected = [s for s in pool if s.is_connected.is_set()] or pool
+        candidates = [s for s in connected if s not in avoid] or connected
+        n = len(candidates)
+        best = best_score = overall = None
+
+        for k in range(n):
+            s = candidates[(idx + k) % n]  # equal scores rotate instead of piling onto one connection
+            st = self._media_state(s)
+            score = (st[0] + 1) * (st[1] or default)
+
+            if overall is None or score < overall:
+                overall = score  # soonest finish anywhere, even on a connection whose slots are full
+
+            if (
+                not ignore_slots
+                and st[0] >= self.DOWNLOAD_PIPELINE_DEPTH
+                and s.is_connected.is_set()
+            ):
+                continue
+
+            if best is None or score < best_score:
+                best, best_score = s, score
+
+        # Handing a chunk to a slow connection only because a fast one is momentarily full would
+        # make it the one the whole in-order pipeline waits for. Wait for the fast one instead.
+        if best is not None and not ignore_slots and best_score > 2.0 * overall:
+            return None
+
+        return best
+
+    async def _acquire_media_session(self, dc_id: int, idx: int, avoid=(), force: bool = False) -> Session:
+        """Reserve a request slot on the best connection, waiting while all of them are full.
+
+        Chunks queue here in order and the next free slot goes to the soonest-finishing connection
+        (work stealing). `force` skips the slot limit; used for the duplicate of a stalled request,
+        which must not wait behind the very queue it is trying to bypass.
+        """
+        event = self._slot_events.get(dc_id)
+
+        if event is None:
+            event = self._slot_events[dc_id] = asyncio.Event()
+
+        while True:
+            for s in list(self.media_session_pool.get(dc_id, ())):
+                if s.failure is not None:
+                    self._evict_media_session(dc_id, s)
+
+            session = self._best_media_session(dc_id, idx, avoid, ignore_slots=force)
+
+            if session is None and not self.media_session_pool.get(dc_id):
+                session = await self._get_media_session(dc_id)
+
+            if session is not None:
+                self._media_state(session)[0] += 1
+                return session
+
+            event.clear()  # nothing awaited since the check above, so a release cannot be missed
+            await event.wait()
+
+    def _release_media_session(self, session, dc_id: int, took: float = None):
+        st = self._media_state(session)
+        st[0] = max(0, st[0] - 1)
+
+        if took is not None:
+            st[1] = took if st[1] is None else 0.7 * st[1] + 0.3 * took
+
+        event = self._slot_events.get(dc_id)
+
+        if event is not None:
+            event.set()
+
+    async def _get_file_chunk(
+        self, dc_id: int, location, offset: int, limit: int, idx: int = 0,
+        flight: "_Flight" = None, avoid=(), force: bool = False,
+    ):
         """One upload.GetFile with connection-level retries.
 
         Session.invoke() already retries on the same connection; this adds a second layer that
         moves the request to another connection (and drops dead ones), so one bad socket can no
-        longer abort a multi-gigabyte download.
+        longer abort a multi-gigabyte download. `flight` records where the request ran, so a
+        duplicate can be sent somewhere else, and when it went on the wire.
         """
         last_error = None
+        tried = []
 
         for attempt in range(self.CHUNK_RETRIES):
-            session = await self._pick_media_session(dc_id, idx, attempt)
+            session = await self._acquire_media_session(
+                dc_id, idx + attempt, (*avoid, *tried), force=force
+            )
+
+            started = self.loop.time()
+            took = None
+
+            if flight is not None:
+                flight.sessions.append(session)
+                flight.since = started
 
             try:
-                return await session.invoke(
+                result = await session.invoke(
                     raw.functions.upload.GetFile(location=location, offset=offset, limit=limit),
                     retries=2,
                     timeout=Session.MEDIA_WAIT_TIMEOUT,
                     sleep_threshold=self.sleep_threshold,
                 )
+                took = self.loop.time() - started
+
+                return result
             except (OSError, TimeoutError, asyncio.TimeoutError, InternalServerError, ServiceUnavailable) as e:
                 if getattr(e, "ID", None) in self._FATAL_CHUNK_ERRORS:
                     raise
 
                 last_error = e
+                tried.append(session)
 
                 if session.failure is not None:
                     self._evict_media_session(dc_id, session)
@@ -1410,8 +1509,10 @@ class Client(Methods):
                     "GetFile offset=%s failed on DC%s (attempt %s/%s): %r",
                     offset, dc_id, attempt + 1, self.CHUNK_RETRIES, e,
                 )
+            finally:
+                self._release_media_session(session, dc_id, took)
 
-                await asyncio.sleep(min(0.25 * 2 ** attempt, 2.0))
+            await asyncio.sleep(min(0.25 * 2 ** attempt, 2.0))  # after the slot is given back
 
         raise last_error
 
@@ -1424,6 +1525,7 @@ class Client(Methods):
         chunk_size: int,
         idx: int,
         hedge_after: float,
+        avoid=(),
     ):
         """Result of an in-flight GetFile, racing a duplicate request if it stalls.
 
@@ -1452,7 +1554,9 @@ class Client(Methods):
                     # idx + 1 sends the duplicate to the next connection in the round-robin
                     racers.add(
                         self.loop.create_task(
-                            self._get_file_chunk(dc_id, location, offset, chunk_size, idx + 1)
+                            self._get_file_chunk(
+                                dc_id, location, offset, chunk_size, idx + 1, avoid=tuple(avoid), force=True
+                            )
                         )
                     )
 
@@ -1576,9 +1680,28 @@ class Client(Methods):
                 else None
             )
 
+            flights = {}  # task -> _Flight
+            durations = deque(maxlen=64)  # how long recent requests took on the wire
+
             def count(task):
+                flight = flights.pop(task, None)
+
                 if not task.cancelled() and task.exception() is None:
                     received[0] += len(getattr(task.result(), "bytes", b""))
+
+                    if flight is not None and flight.since is not None:
+                        durations.append(self.loop.time() - flight.since)
+
+            def launch(at, idx, burst=False):
+                # `burst`: the first requests go out before the extra connections exist, so they
+                # may all share the one that is up instead of queueing for slots
+                flight = _Flight()
+                task = self.loop.create_task(
+                    self._get_file_chunk(dc_id, location, at, chunk_size, idx, flight, force=burst)
+                )
+                flights[task] = flight
+                task.add_done_callback(count)
+                return task
 
             reporter_done = False
 
@@ -1607,10 +1730,7 @@ class Client(Methods):
                             parts_left = -(-(file_size - offset_bytes) // chunk_size) - 1
                             ahead = max(0, min(2 * self.DOWNLOAD_PIPELINE_DEPTH - 1, parts_left, total - 1))
 
-                        first = self.loop.create_task(
-                            self._get_file_chunk(dc_id, location, offset_bytes, chunk_size)
-                        )
-                        first.add_done_callback(count)
+                        first = launch(offset_bytes, 0, True)
 
                         # Open the extra connections now, not after the first answer: their
                         # handshakes overlap that round trip, so the speed climbs to full in one
@@ -1621,20 +1741,9 @@ class Client(Methods):
                             await self._get_media_sessions(dc_id, wanted)
 
                         spec = [
-                            (
-                                self.loop.create_task(
-                                    self._get_file_chunk(
-                                        dc_id, location, offset_bytes + k * chunk_size, chunk_size, k
-                                    )
-                                ),
-                                offset_bytes + k * chunk_size,
-                                k,
-                            )
+                            (launch(offset_bytes + k * chunk_size, k, True), offset_bytes + k * chunk_size, k)
                             for k in range(1, ahead + 1)
                         ]
-
-                        for t, _, _ in spec:
-                            t.add_done_callback(count)
 
                         try:
                             r = await first
@@ -1678,7 +1787,7 @@ class Client(Methods):
                             for s in self.media_session_pool.get(dc_id, ())
                             if s.failure is None
                         )
-                        return max(1, live) * self.DOWNLOAD_PIPELINE_DEPTH
+                        return min(64, max(1, live) * self.DOWNLOAD_PIPELINE_DEPTH * self.DOWNLOAD_BUFFER_FACTOR)
 
                     def top_up():
                         nonlocal next_offset, scheduled
@@ -1690,20 +1799,11 @@ class Client(Methods):
                             and scheduled < total
                             and (file_size == 0 or next_offset < file_size)
                         ):
-                            task = self.loop.create_task(
-                                self._get_file_chunk(
-                                    dc_id, location, next_offset, chunk_size, scheduled
-                                )
-                            )
-                            task.add_done_callback(count)
+                            task = launch(next_offset, scheduled)
                             pending.append((task, next_offset, scheduled))
                             next_offset += chunk_size
                             scheduled += 1
 
-                    # Recent waits for the next in-order chunk. The median is the usual pace: a
-                    # stalled connection is an outlier and must not raise the bar for hedging the
-                    # next stall, while a link that slows down for good moves the median with it.
-                    waits = deque(maxlen=16)
                     hedge_floor = self.DOWNLOAD_HEDGE_AFTER
 
                     try:
@@ -1734,20 +1834,33 @@ class Client(Methods):
 
                             task, task_offset, task_idx = pending.popleft()
 
-                            # A real stall is many times the usual wait; slow-but-steady links
-                            # (large median wait) are therefore never hedged needlessly.
+                            # A request is a stall when it takes much longer than recent requests did
+                            # (not longer than the gaps between chunks: with parallel connections those
+                            # are tiny even on a slow link, which would hedge everything). Slow but
+                            # steady links raise the bar by themselves.
                             if not hedge_floor:
                                 hedge_after = 0
-                            elif len(waits) < 4:
-                                hedge_after = hedge_floor * 3  # no pace known yet
                             else:
-                                hedge_after = max(hedge_floor, 6 * sorted(waits)[len(waits) // 2])
+                                if len(durations) < 8:
+                                    # pace still being learned: trust what has completed so far
+                                    limit_s = max(hedge_floor * 3, 3 * max(durations, default=0))
+                                else:
+                                    p75 = sorted(durations)[len(durations) * 3 // 4]
+                                    limit_s = max(hedge_floor, 2.5 * p75)
 
-                            started = self.loop.time()
+                                flight = flights.get(task)
+                                now = self.loop.time()
+
+                                if flight is None or flight.since is None:
+                                    hedge_after = limit_s  # still queued for a slot: not stalled yet
+                                else:
+                                    hedge_after = max(0.05, flight.since + limit_s - now)
+
+                            flight = flights.get(task)
                             r = await self._next_chunk(
-                                task, dc_id, location, task_offset, chunk_size, task_idx, hedge_after
+                                task, dc_id, location, task_offset, chunk_size, task_idx,
+                                hedge_after, flight.sessions if flight is not None else (),
                             )
-                            waits.append(self.loop.time() - started)
                     finally:
                         # Drop speculative requests (EOF, cancel, error) without leaking warnings
                         for task, _, _ in pending:
@@ -1860,6 +1973,17 @@ class Client(Methods):
 
     def guess_extension(self, mime_type: str) -> Optional[str]:
         return self.mimetypes.guess_extension(mime_type)
+
+
+class _Flight:
+    """Where one chunk request is running: the connections it used and when the current attempt
+    actually went on the wire (not when it was queued for a slot)."""
+
+    __slots__ = ("sessions", "since")
+
+    def __init__(self):
+        self.sessions = []
+        self.since = None
 
 
 class _ProgressReporter:
