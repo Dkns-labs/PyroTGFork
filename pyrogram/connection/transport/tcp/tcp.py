@@ -1,21 +1,3 @@
-#  Pyrogram - Telegram MTProto API Client Library for Python
-#  Copyright (C) 2017-present Dan <https://github.com/delivrance>
-#
-#  This file is part of Pyrogram.
-#
-#  Pyrogram is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Lesser General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#
-#  Pyrogram is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
-
 import asyncio
 import ipaddress
 import logging
@@ -126,6 +108,15 @@ class TCP:
                 sock=sock,
                 limit=self.SOCKET_BUFFER_SIZE
             )
+
+            # Same write-buffer limits as a direct connection, so a 512 KB part does not pause
+            # the protocol on the (small) default high-water mark of a proxied upload.
+            transport = self.writer.transport
+            if hasattr(transport, "set_write_buffer_limits"):
+                transport.set_write_buffer_limits(
+                    high=self.SOCKET_BUFFER_SIZE,
+                    low=self.SOCKET_BUFFER_SIZE // 4
+                )
         else:
             self.reader, self.writer = await asyncio.open_connection(
                 host=address[0],
@@ -178,20 +169,27 @@ class TCP:
                 raise OSError(e)
 
     async def recv(self, length: int = 0) -> Optional[bytes]:
-        data = bytearray()
+        # Chunks are collected and joined once. Growing a bytearray and converting it with bytes()
+        # copied every received byte twice more; a frame that arrives in one piece is returned as is.
+        chunks = []
+        received = 0
 
-        while len(data) < length:
+        while received < length:
             try:
                 chunk = await asyncio.wait_for(
-                    self.reader.read(length - len(data)),
+                    self.reader.read(length - received),
                     timeout=TCP.TIMEOUT
                 )
             except (OSError, asyncio.TimeoutError):
                 return None
             else:
-                if chunk:
-                    data.extend(chunk)
-                else:
+                if not chunk:
                     return None
 
-        return bytes(data)
+                chunks.append(chunk)
+                received += len(chunk)
+
+        if len(chunks) == 1:
+            return chunks[0]
+
+        return b"".join(chunks)
