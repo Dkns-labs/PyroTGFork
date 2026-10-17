@@ -236,7 +236,7 @@ class Session:
 
     async def handle_packet(self, packet):
         try:
-            if aes.is_inline(len(packet)):
+            if aes.is_inline_ige(len(packet)):
                 data = mtproto.unpack(
                     BytesIO(packet), self.session_id, self.auth_key, self.auth_key_id
                 )
@@ -406,7 +406,7 @@ class Session:
         log.debug(f"Sent:")
         log.debug(message)
 
-        if aes.is_inline(self._payload_size(data)):
+        if aes.is_inline_ige(self._payload_size(data)):
             payload = mtproto.pack(
                 message, self.salt, self.session_id, self.auth_key, self.auth_key_id
             )
