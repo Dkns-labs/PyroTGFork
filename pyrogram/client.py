@@ -148,6 +148,11 @@ class Client(Methods):
     DOWNLOAD_RESUMES = max(0, int(os.environ.get("PYROGRAM_DL_RESUMES", 3)))
     DOWNLOAD_RESUME_DELAY = 1.0  # first back-off in seconds, doubled per resume, capped at 8 s
 
+    # A part whose retries on the pool are used up is tried again after a back-off instead of
+    # failing the whole upload (a 10-30 s network blip no longer loses a multi-GB upload).
+    UPLOAD_RESUMES = max(0, int(os.environ.get("PYROGRAM_UL_RESUMES", 3)))
+    UPLOAD_RESUME_DELAY = 1.0  # same back-off as downloads: doubled per resume, capped at 8 s
+
     # The public `offset` / `limit` of get_file() and stream_media() count units of 1 MiB,
     # independent of the (possibly smaller) request size used on the wire.
     FILE_UNIT = 1024 * 1024
