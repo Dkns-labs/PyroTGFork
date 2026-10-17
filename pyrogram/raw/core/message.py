@@ -1,21 +1,3 @@
-#  Pyrogram - Telegram MTProto API Client Library for Python
-#  Copyright (C) 2017-present Dan <https://github.com/delivrance>
-#
-#  This file is part of Pyrogram.
-#
-#  Pyrogram is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Lesser General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#
-#  Pyrogram is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
-
 from io import BytesIO
 from typing import Any
 
@@ -26,15 +8,18 @@ from .tl_object import TLObject
 class Message(TLObject):
     ID = 0x5BB8E511  # hex(crc32(b"message msg_id:long seqno:int bytes:int body:Object = Message"))
 
-    __slots__ = ["msg_id", "seq_no", "length", "body"]
+    __slots__ = ["msg_id", "seq_no", "length", "body", "_raw_body"]
 
     QUALNAME = "Message"
 
-    def __init__(self, body: TLObject, msg_id: int, seq_no: int, length: int):
+    def __init__(self, body: TLObject, msg_id: int, seq_no: int, length: int, raw_body: bytes = None):
         self.msg_id = msg_id
         self.seq_no = seq_no
         self.length = length
         self.body = body
+        # `body` already serialized. MsgFactory has to serialize it once to learn `length`; keeping
+        # the bytes means a 512 KiB file part is not serialized (and copied) a second time in write()
+        self._raw_body = raw_body
 
     @staticmethod
     def read(data: BytesIO, *args: Any) -> "Message":
@@ -46,11 +31,7 @@ class Message(TLObject):
         return Message(TLObject.read(BytesIO(body)), msg_id, seq_no, length)
 
     def write(self, *args: Any) -> bytes:
-        b = BytesIO()
+        body = self._raw_body if self._raw_body is not None else self.body.write()
 
-        b.write(Long(self.msg_id))
-        b.write(Int(self.seq_no))
-        b.write(Int(self.length))
-        b.write(self.body.write())
-
-        return b.getvalue()
+        # one join = one copy of the (up to 1 MiB) body, instead of BytesIO.write() + getvalue()
+        return b"".join((Long(self.msg_id), Int(self.seq_no), Int(self.length), body))
