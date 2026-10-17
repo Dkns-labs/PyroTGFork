@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import struct
+import warnings
 from concurrent.futures.thread import ThreadPoolExecutor
 from datetime import datetime, timezone
 from getpass import getpass
@@ -35,7 +36,54 @@ from pyrogram import types
 from pyrogram.file_id import FileId, FileType, PHOTO_TYPES, DOCUMENT_TYPES
 
 
+def _new_uvloop() -> Optional[asyncio.AbstractEventLoop]:
+    """A uvloop event loop, but only when nothing has chosen a loop yet.
+
+    Used only when
+    - uvloop is installed and PYROGRAM_UVLOOP is not "0",
+    - the event loop policy is still asyncio's own (the user did not install their own, e.g. with
+      uvloop.install()), and
+    - no loop has been set for this thread yet.
+    A loop the application created itself is never replaced.
+    """
+    if os.environ.get("PYROGRAM_UVLOOP", "1") == "0":
+        return None
+
+    try:
+        import uvloop
+    except ImportError:
+        return None
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # policies are deprecated in 3.14
+            policy = asyncio.get_event_loop_policy()
+
+        if not type(policy).__module__.startswith("asyncio"):
+            return None  # a custom policy (uvloop.install() included) is the user's choice
+
+        if getattr(getattr(policy, "_local", None), "_loop", None) is not None:
+            return None  # a loop is already set
+
+        loop = uvloop.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        return loop
+    except Exception:
+        return None
+
+
 def get_event_loop() -> asyncio.AbstractEventLoop:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    loop = _new_uvloop()
+
+    if loop is not None:
+        return loop
+
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
