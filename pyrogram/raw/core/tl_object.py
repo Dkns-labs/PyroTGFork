@@ -1,21 +1,3 @@
-#  Pyrogram - Telegram MTProto API Client Library for Python
-#  Copyright (C) 2017-present Dan <https://github.com/delivrance>
-#
-#  This file is part of Pyrogram.
-#
-#  Pyrogram is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Lesser General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#
-#  Pyrogram is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
-
 from io import BytesIO
 from json import dumps
 from typing import cast, Any, Union, TypeVar, Generic
@@ -47,7 +29,7 @@ class TLObject(Generic[ReturnType]):
             **{
                 attr: getattr(obj, attr)
                 for attr in obj.__slots__
-                if getattr(obj, attr) is not None
+                if not attr.startswith("_") and getattr(obj, attr) is not None
             }
         }
 
@@ -63,12 +45,15 @@ class TLObject(Generic[ReturnType]):
             ", ".join(
                 f"{attr}={repr(getattr(self, attr))}"
                 for attr in self.__slots__
-                if getattr(self, attr) is not None
+                if not attr.startswith("_") and getattr(self, attr) is not None
             )
         )
 
     def __eq__(self, other: Any) -> bool:
         for attr in self.__slots__:
+            if attr.startswith("_"):
+                continue  # internal caches (e.g. Message._raw_body) are not part of the value
+
             try:
                 if getattr(self, attr) != getattr(other, attr):
                     return False
