@@ -79,7 +79,7 @@ def _load_openssl():
     # Skipped when a different backend (or pyaes) was forced via PYROGRAM_CRYPTO.
     forced = os.environ.get("PYROGRAM_CRYPTO", "").strip().lower()
 
-    if forced and forced != "cryptography":
+    if forced and forced not in ("cryptography", "libcrypto"):
         return None
 
     try:
@@ -91,6 +91,86 @@ def _load_openssl():
 
 
 _openssl = _load_openssl() if _native is None else None
+
+
+# Known answer for the IGE self-test below: key=0..31, iv=32..63, plaintext=0..47.
+_KAT_KEY = bytes(range(32))
+_KAT_IV = bytes(range(32, 64))
+_KAT_PLAIN = bytes(range(48))
+_KAT_CIPHER = bytes.fromhex(
+    "42e66e1a756cccf5b27acc47523ad074ee39bf54e3db37bbdf415df6b400fca9"
+    "77f708327c9e9341cc3dc8efd31e7646"
+)
+
+
+def _load_libcrypto_ige():
+    # Fastest IGE available without a Telegram-specific extension: OpenSSL's own AES_ige_encrypt
+    # called through ctypes. The `cryptography` tier below has to run the IGE chaining in a Python
+    # loop (one OpenSSL call per 16-byte block, ~25 MB/s); here the whole buffer is one C call
+    # (~60-110 MB/s) and ctypes releases the GIL, so crypto_executor threads really run in parallel.
+    # Needs no compiler and no extra package, only a system libcrypto that still exports the legacy
+    # AES_* functions. Anything missing or wrong (library, symbols, self-test) just returns None
+    # and the next tier is used. Skipped when another backend was forced via PYROGRAM_CRYPTO.
+    forced = os.environ.get("PYROGRAM_CRYPTO", "").strip().lower()
+
+    if forced and forced != "libcrypto":
+        return None
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        path = ctypes.util.find_library("crypto")
+
+        if not path:
+            return None
+
+        lib = ctypes.CDLL(path)
+
+        set_enc, set_dec, ige = lib.AES_set_encrypt_key, lib.AES_set_decrypt_key, lib.AES_ige_encrypt
+
+        set_enc.argtypes = set_dec.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+        set_enc.restype = set_dec.restype = ctypes.c_int
+        ige.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        ige.restype = None
+
+        create = ctypes.create_string_buffer
+
+        def run(data, key, iv, encrypt: bool) -> bytes:
+            size = len(data)
+
+            if size % 16:
+                raise ValueError("IGE data length must be a multiple of 16")
+
+            if len(key) != 32 or len(iv) != 32:
+                raise ValueError("IGE needs a 32-byte key and a 32-byte iv")
+
+            schedule = create(512)  # AES_KEY is 244 bytes
+            out = create(size)
+
+            if (set_enc if encrypt else set_dec)(bytes(key), 256, schedule) != 0:
+                raise ValueError("AES key setup failed")
+
+            # AES_ige_encrypt updates the iv in place: hand it a private mutable copy, never the
+            # caller's (immutable) bytes object.
+            ige(bytes(data), out, size, schedule, create(bytes(iv), 32), 1 if encrypt else 0)
+
+            return out.raw
+
+        # Wrong output must never reach the network: prove the backend on a known answer first.
+        if run(_KAT_PLAIN, _KAT_KEY, _KAT_IV, True) != _KAT_CIPHER:
+            raise ValueError("libcrypto IGE encrypt self-test failed")
+
+        if run(_KAT_CIPHER, _KAT_KEY, _KAT_IV, False) != _KAT_PLAIN:
+            raise ValueError("libcrypto IGE decrypt self-test failed")
+    except Exception as e:  # missing library / symbol (OpenSSL built without legacy AES) / bad output
+        log.debug("libcrypto IGE not used: %r", e)
+        return None
+
+    return (lambda d, k, i: run(d, k, i, True)), (lambda d, k, i: run(d, k, i, False))
+
+
+_libcrypto_ige = _load_libcrypto_ige() if _native is None else None
 
 # True when a compiled backend (hypercrypto / warpcrypto / tgcrypto) is in use
 NATIVE = _native is not None
@@ -292,3 +372,18 @@ else:
                     chunk = cipher.encrypt(iv)
 
         return bytes(out)
+
+
+# IGE is what every downloaded/uploaded chunk goes through, so when no Telegram-specific native
+# backend is present the libcrypto implementation replaces the Python-loop / pyaes one.
+if _libcrypto_ige is not None:
+    log.info("Using libcrypto (OpenSSL) for IGE")
+
+    ige256_encrypt, ige256_decrypt = _libcrypto_ige
+
+
+def is_inline_ige(size: int) -> bool:
+    # Same idea as is_inline(), for code paths that only do IGE (mtproto pack/unpack): the libcrypto
+    # tier handles a small frame in well under 100 us, so the executor hand-off is the costlier part.
+    # is_inline() stays False for it because CTR (obfuscated transports) may still be pure Python.
+    return (NATIVE or _libcrypto_ige is not None) and INLINE_LIMIT > 0 and size <= INLINE_LIMIT
