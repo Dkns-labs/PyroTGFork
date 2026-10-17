@@ -28,6 +28,7 @@ from typing import BinaryIO, Callable, Optional, Union
 import pyrogram
 from pyrogram import StopTransmission, raw
 from pyrogram.transfer import ProgressReporter
+from pyrogram.transfer.resume import with_resumes
 
 log = logging.getLogger(__name__)
 
@@ -136,7 +137,18 @@ class SaveFile:
 
                 # The pool picks the connection, re-sends a stalled part elsewhere and retries
                 # failures on other connections; a part is idempotent, so a duplicate is harmless.
-                await pool.request(home_dc, rpc, idx=part_index, job=job)
+                await with_resumes(
+                    lambda: pool.request(home_dc, rpc, idx=part_index, job=job),
+                    resumes=self.UPLOAD_RESUMES,
+                    delay=self.UPLOAD_RESUME_DELAY,
+                    cap=8,
+                    retryable=pool.RETRYABLE,
+                    give_up=lambda: bool(errors) or (reporter is not None and reporter.error is not None),
+                    on_retry=lambda n, wait, e: log.warning(
+                        "Upload part %s still failing (%r): resume %s/%s in %.0f s",
+                        part_index, e, n, self.UPLOAD_RESUMES, wait,
+                    ),
+                )
                 job.add(len(chunk))  # the more a transfer has moved, the lower its priority
 
             async def worker():
