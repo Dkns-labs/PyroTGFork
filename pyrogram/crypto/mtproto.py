@@ -1,21 +1,3 @@
-#  Pyrogram - Telegram MTProto API Client Library for Python
-#  Copyright (C) 2017-present Dan <https://github.com/delivrance>
-#
-#  This file is part of Pyrogram.
-#
-#  Pyrogram is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Lesser General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#
-#  Pyrogram is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
-
 import logging
 from hashlib import sha256
 from io import BytesIO
@@ -82,18 +64,21 @@ else:
 
 
 def pack(message: Message, salt: int, session_id: bytes, auth_key: bytes, auth_key_id: bytes) -> bytes:
-    data = Long(salt) + session_id + message.write()
-    padding = urandom(-(len(data) + 12) % 16 + 12)
+    body = message.write()
+
+    # The padding length only depends on the size, so it is known before the plaintext exists and
+    # the plaintext is built with ONE copy of the (up to 1 MB) message instead of two.
+    padding = urandom(-(len(body) + 16 + 12) % 16 + 12)
+    data = b"".join((Long(salt), session_id, body, padding))
 
     # 88 = 88 + 0 (outgoing message)
     # Hashed incrementally so the (up to 1 MB) message is not copied into one more temporary buffer.
     digest = sha256(auth_key[88: 88 + 32])
     digest.update(data)
-    digest.update(padding)
     msg_key = digest.digest()[8:24]
     aes_key, aes_iv = kdf(auth_key, msg_key, True)
 
-    return auth_key_id + msg_key + aes.ige256_encrypt(data + padding, aes_key, aes_iv)
+    return b"".join((auth_key_id, msg_key, aes.ige256_encrypt(data, aes_key, aes_iv)))
 
 
 def unpack(
