@@ -3,7 +3,17 @@ name = "pyrotgfork"
 dynamic = ["version"]
 description = "Fork of Pyrogram. Elegant, modern and asynchronous Telegram MTProto API framework in Python for users and bots"
 authors = [{ name = "SpEcHIDe", email = "pyrogram@iamidiotareyoutoo.com" }]
-dependencies = ["pyaes<=1.6.1", "pysocks<=1.7.1"]
+dependencies = [
+    "pyaes<=1.6.1",
+    "pysocks<=1.7.1",
+    # Native MTProto crypto (IGE/CTR) installed by default. Without it the library falls back to
+    # pure-Python pyaes, which moves well under 1 MB/s. WarpCrypto ships wheels for Linux (glibc and
+    # musl), macOS and Windows on every supported Python, so a plain `pip install` never compiles.
+    "warpcrypto>=2.0.8",
+    # libuv based event loop, used automatically when no other loop was chosen (PYROGRAM_UVLOOP=0 opts out)
+    "uvloop>=0.21; sys_platform != 'win32' and implementation_name == 'cpython'",
+]
+
 readme = "README.md"
 license = "LGPL-3.0-or-later"
 requires-python = ">=3.9"
@@ -99,7 +109,11 @@ docs = [
     "sphinx-llms-txt==0.7.1"
 ]
 
+# pip install "pyrotgfork[fast]": the fastest native backend on top of the defaults. HyperCrypto is picked
+# first by pyrogram.crypto when importable (about 15% faster IGE and 3x faster CTR than WarpCrypto);
+# it needs Python >= 3.10 and a glibc/macOS/Windows wheel, so it stays out of the default dependencies.
 fast = [
-    "PyTgCrypto>1.2.9.2,<=1.4",
-    "uvloop>0.18.0,<=0.19.0"
+    "hypercrypto>=0.1.5; python_version >= '3.10'",
+    "warpcrypto>=2.0.8",
+    "uvloop>=0.21; sys_platform != 'win32' and implementation_name == 'cpython'"
 ]
